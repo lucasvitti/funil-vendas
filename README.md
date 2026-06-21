@@ -1,3 +1,5 @@
+**English** | [Português](README.pt-BR.md)
+
 # counter_vision
 
 Multi-camera **people counting + dwell detection** from a single movable unit.
