@@ -2,16 +2,44 @@
 
 # counter_vision
 
-Multi-camera **people counting + dwell detection** from a single movable unit.
-One enclosure holds a Raspberry Pi 5 + AI HAT+ (Hailo) + wide cameras pointing
-**outward** to cover an area. Goal: count **footfall** (people in/around the area)
-*and* **stops** (people who dwell ≥ N seconds at a service point).
+Multi-camera **people counting + dwell detection** for a physical-retail service
+point, in two tiers:
+
+- **Edge unit** — one movable enclosure (Raspberry Pi 5 + AI HAT+ / Hailo + wide
+  CSI cameras) detects, tracks and counts **footfall** (people crossing a tripwire)
+  and **stops** (people who dwell ≥ N seconds in a zone), with faces **pixelated on
+  the device** before anything is saved (LGPD).
+- **Central hub (VPS)** — a FastAPI + SQLite service receives the anonymous counts
+  (and, in pilot, re-ID vectors + pixelated snapshots) and serves a **hosted
+  geometry/config editor** and a **conversion dashboard**. The board **pulls its
+  config from the hub on boot**.
+
+One question per service point: **of the people who pass, how many stop — and for
+how long?** (conversion = stops ÷ passers).
 
 **Phase-1 build: 2× wide CSI cameras → ~180°** (unit against a wall/counter). The
 Pi 5 has only 2 CSI ports, so 2 is the native simultaneous max. The code is
 **N-camera** throughout, so a later **360°** deployment (4 cameras) is a hardware +
-config change, not a rewrite — via a Compute Module 5 + 4-CSI carrier, or imported
-USB camera modules. See "Future 360°" below.
+config change, not a rewrite. See "Future 360°".
+
+## Architecture
+
+```
+EDGE UNIT — Raspberry Pi 5 + AI HAT+ (Hailo) + 2 wide CSI cams (~180°)
+   per camera, independently:
+   capture ─► person detect (Hailo) ─► track (ByteTrack)
+        │   counting geometry (pulled from the hub), per camera:
+        ▼   tripwire → footfall      zone + dwell ≥ N s → stop
+   faces pixelated on-device (LGPD) → local SQLite + snapshots + re-ID vectors
+        │
+        │   count.py + upload_to_server.py  — systemd, auto-restart
+        ▼   HTTPS + Bearer token, OUTBOUND ONLY (board behind NAT)
+CENTRAL HUB — VPS: FastAPI + SQLite behind nginx + Let's Encrypt
+   ├─ /config   hosted geometry + parameter editor → board pulls on boot
+   ├─ /         conversion dashboard (date range · granularity · place ·
+   │            images/vectors · pagination · freshness · downloads · purge)
+   └─ /api/*    events · vectors · snapshots · frames · config · capture
+```
 
 ## How counting works (per-camera sectors, not multi-view fusion)
 
@@ -46,31 +74,30 @@ presence, and to make the counting geometry **non-overlapping by construction**:
   goes to the better-viewing camera; the other ignores it.
 - Only genuinely seam-straddling cases need a fuzzy **boundary hand-off** (match a
   track leaving cam A's seam to one entering cam B within a short time window via a
-  cheap color/appearance signature) — optional, Phase 4. No full cross-camera re-ID.
+  cheap color/appearance signature) — optional. No full cross-camera re-ID.
 
-The Phase 3 geometry editor enforces the one invariant: **lines/zones must not
+The hosted geometry editor enforces the one invariant: **lines/zones must not
 overlap in coverage.** That single rule is what guarantees no double counting.
 
-```
-N cameras (outward: 2→180° now, up to 4→360° later)
-        │   per camera, independently:
-        ▼
-   person detect (Hailo / CPU dev) ─► track (ByteTrack)
-        │
-        ▼   counting geometry drawn in each camera's image:
-   tripwire line → footfall          zone + dwell ≥ N s → stop
-        │
-        ▼
-   aggregate across cameras + boundary dedup at sector overlaps
-        │
-        ▼
-   counts (footfall / stops per interval) + sample snapshots
-        │
-        ▼
-   local SQLite/CSV ──(opt rsync)──► VPS dashboard
-```
+## Privacy & LGPD
 
-## Board-agnostic by design
+Personal data (faces, re-ID vectors, images) is minimized and tightly scoped:
+
+- **Faces pixelated on the device** before any frame is saved or uploaded — no raw
+  face ever leaves the board.
+- **Counts are anonymous aggregates** (pass/stop events; no identity).
+- **Re-ID (pilot) is a clothing/body colour signature, not biometric** — opt-in,
+  matched only within a short window, auto-erased after a retention period;
+  face/full (biometric) modes are gated.
+- **Data purge**: the dashboard erases vectors + pixelated images for a chosen date
+  range; the server also auto-deletes both after `COUNTER_RETAIN_DAYS`.
+- **Per-device "place" label** is logged on every event/vector/image, so location
+  history is preserved when the movable unit is relocated.
+- Token never in the repo (env / `~/.counter_token`); TLS + HSTS everywhere;
+  backend bound to localhost behind nginx. A posted notice at the counter + a
+  documented retention policy are part of the deployment.
+
+## The edge unit (board-agnostic by design)
 
 The code abstracts the two hardware-specific layers so the detector/camera choice
 can change without touching the pipeline:
@@ -78,16 +105,15 @@ can change without touching the pipeline:
 - **Camera source** (`src/cameras/`): `USBCamera` (OpenCV) for laptop dev, and
   `Picamera2Camera` (CSI, on the Pi). Both are `CameraSource` subclasses; the
   pipeline never sees the difference.
-- **Detector** (`src/detect/`, Phase 2): pluggable backend — `cpu` (Ultralytics,
-  for laptop dev) and `hailo` (HailoRT on the AI HAT+, production on the Pi).
+- **Detector** (`src/detect/`): pluggable backend — `cpu` (Ultralytics, for laptop
+  dev) and `hailo` (HailoRT on the AI HAT+, production on the Pi).
 
-**Hardware decision: one tethered movable unit = Raspberry Pi 5 + AI HAT+ 13 TOPS
-(Hailo-8L) + 2× wide CSI cameras**, in a 3D-printed case. Pi 5 from Mercado Livre;
-AI HAT+ from MakerHero. The Hailo runs YOLOv8 person detection on both streams in
-real time with huge headroom — enough to run a **larger/more accurate model**
-(YOLOv8s/m) since only 2 streams share 13 TOPS. 4 GB RAM is fine (inference on the
-Hailo). The HAT is on **PCIe**; the cameras are on **CSI** — so all USB ports stay
-free and no hub is needed.
+**Hardware: one tethered movable unit = Raspberry Pi 5 + AI HAT+ 13 TOPS
+(Hailo-8L) + 2× wide CSI cameras**, in a 3D-printed case. The Hailo runs YOLOv8
+person detection on both streams in real time with huge headroom — enough to run a
+**larger/more accurate model** (YOLOv8s/m) since only 2 streams share 13 TOPS. The
+HAT is on **PCIe**; the cameras are on **CSI** — so all USB ports stay free and no
+hub is needed.
 
 **Cameras: 2× wide CSI modules.** Recommended: **Raspberry Pi Camera Module 3
 Wide** (IMX708, ~120° diagonal ≈ ~102° horizontal, autofocus). Two at ~90° apart
@@ -98,14 +124,10 @@ horizontal and would leave a gap. Arducam wide IMX219 modules also work.
 cameras ship with a **15-pin** ribbon — buy a **15→22-pin Pi 5 adapter cable** per
 camera.
 
-Detector backend = **HailoRT on the AI HAT+**:
-- Officially supported on Pi OS via the **`hailo-all`** apt package (HailoRT +
-  PCIe driver + tooling) — a maintained, smooth stack.
-- Use a **pre-compiled YOLOv8/person `.hef`** from Hailo's model zoo (no
-  self-compiling in the common case). The Hailo Dataflow Compiler is x86-only if
-  you ever build a custom `.hef`.
-- The HAT stacks above the Pi 5 (PCIe FPC + GPIO standoffs, above the active
-  cooler) → the 3D case must allow the extra stack height.
+Detector backend = **HailoRT on the AI HAT+**: officially supported on Pi OS via
+the **`hailo-all`** apt package (HailoRT + PCIe driver + tooling); use a
+**pre-compiled YOLOv8/person `.hef`** from Hailo's model zoo (the Dataflow Compiler
+is x86-only if you ever build a custom `.hef`).
 
 ### Future 360°
 
@@ -116,86 +138,85 @@ B0201 / ELP, UVC+MJPEG, ~90–120°, avoid fisheye) and add a powered hub. Desig
 3D case with a **swappable front camera mount** so a 4-camera ring can replace the
 2-camera front later.
 
-Dev/test runs on a plain Windows/Linux laptop webcam (CPU detector) before the
-parts arrive; the Hailo backend swaps in on the Pi via the pluggable detector
-layer.
+## The central hub (VPS)
 
-## Build phases
+A small FastAPI + SQLite service (`server/`) is the hub. Boards reach it **outbound
+only** over HTTPS with a Bearer token — the Pi needs no inbound ports or public IP.
+It provides:
 
-- [x] **Phase 1 — Scaffold & multi-camera capture.** Open N USB cameras, grab
-      near-synchronized frame-sets, save to disk. Proves cameras + config work.
-- [x] **Phase 2 — Detection + per-camera tracking.** YOLOv8 person detection
-      (`cpu` Ultralytics for dev / `hailo` on the AI HAT+) + supervision ByteTrack,
-      with annotated previews. See "Running Phase 2".
-- [ ] **Phase 3 — Counting-geometry editor** (draw a tripwire line + dwell zone
-      per camera, in image space; saved to config — quick to redo when re-aimed).
-- [x] **Phase 4 — Counting logic.** Tripwire crossings = passers (footfall),
-      zone dwell ≥ N s = stops with per-person **duration**; conversion = stops ÷
-      passers. Events → `data/counts.sqlite`; `report.py` summarizes dwell stats.
-      See "Running Phase 4".
-- [ ] **Phase 5 — Output + LGPD** (counts to SQLite/CSV, rate-limited snapshots
-      with auto-deletion / face blur).
-- [ ] **Phase 6 — Service-ize** (systemd unit, runtime-reloadable config).
+- **Hosted geometry + config editor** (`/config`) — per camera: draw the **tripwire
+  line** + **dwell zone** on a live reference frame (or an **uploaded image**),
+  **rotate** to upright (the geometry rotates with it), **collapse** boxes, and set
+  parameters (dwell, confidence, re-ID, uploads, **store/place name**, board
+  timing) grouped by category with inline hints. **"Take shot"** pulls a fresh frame
+  from the board on demand. Saved config — geometry, rotation and parameters — is
+  **pulled by the board on its next boot**.
+- **Conversion dashboard** (`/`) — passers / stops / conversion aggregated from raw
+  events, with a **date-range** filter, **10/30/60-min granularity**, **place**
+  filter, per-bucket columns (date, time, place, passers, stops, conversion,
+  images, vectors), **pagination**, a **board freshness** heartbeat (last-seen),
+  **CSV / images-ZIP** downloads, and a **date-range data purge**.
+- **Auth** — a login session cookie for the UI; the Bearer token for the board
+  `/api/*` endpoints.
 
-## Running Phase 1
+**Deploy:** `server/` ships a `Dockerfile` + `docker-compose.yml` (env
+`COUNTER_TOKEN`, `COUNTER_USER`, `COUNTER_PASS`). It listens on localhost; an nginx
+vhost (`server/nginx-topofunil.conf`) terminates TLS (Let's Encrypt) + HSTS and
+reverse-proxies it. **Rebuild on change with `docker compose up -d --build`** — a
+plain `restart` keeps the old image.
 
+## Running
+
+### On the board — production (systemd)
+
+Two **systemd user services** (`systemd/`) auto-start on boot and restart on
+failure:
 ```bash
-# 1. Install deps (a venv is recommended)
-python -m pip install -r requirements.txt
-
-# 2. Edit config.yaml — set one camera to your laptop's webcam (source: 0)
-#    On Windows, backend: dshow usually works best.
-
-# 3. Capture
-python capture.py
-# Saves a timestamped frame-set every interval_seconds into data/snapshots/.
-# Ctrl+C to stop.
+cp systemd/*.service ~/.config/systemd/user/
+loginctl enable-linger                 # start at boot without an interactive login
+systemctl --user daemon-reload
+systemctl --user enable --now counter counter-upload
+journalctl --user -u counter -f        # logs
 ```
+`counter.service` → `count.py` (cameras + Hailo + counting + on-demand frames);
+`counter-upload.service` → `upload_to_server.py --loop` (events/vectors/images/frames → hub).
 
-## Running Phase 2 (detection + tracking)
-
-Per camera: capture → detect → ByteTrack → annotated `data/annotated/<cam_id>.jpg`
-(overwritten each cycle) + per-camera counts/FPS printed to the console.
-
-**Laptop dev (USB webcam + CPU YOLOv8):**
-```bash
-python -m pip install -r requirements.txt   # incl. ultralytics + supervision
-python detect_preview.py                    # uses config.yaml (cam0 = webcam, backend: cpu)
-```
-
-**On the Pi (2× CSI cameras + Hailo):**
+### On the board — manual
 ```bash
 sudo apt install -y python3-picamera2 hailo-all
-ls /usr/share/hailo-models/                 # confirm yolov8s_h8l.hef path (edit config.pi.yaml if different)
-
 python3 -m venv --system-site-packages .venv   # so it sees picamera2 + hailo
 . .venv/bin/activate
-pip install supervision PyYAML opencv-python    # NOT ultralytics — Hailo does detection
-
-python detect_preview.py config.pi.yaml
+pip install supervision PyYAML opencv-python    # NOT ultralytics — Hailo detects
+python count.py config.pi.yaml                  # live: passers / stops / conversion + SQLite log
+python report.py                                # dwell stats summary
 ```
 
-View the annotated frames headlessly by pulling them (`scp pi-cam.local:.../data/annotated/cam0.jpg .`)
-or serving the folder (`python -m http.server` in `data/annotated`).
-
-> Known first-run tuning points: the exact `.hef` path, and the BGR/RGB channel
-> order in `src/detect/hailo.py` (toggle the `cvtColor` if detections look weak).
-
-## Running Phase 4 (counting)
-
-Needs `geometry.yaml` (draw it with `tools/geometry_editor.html`; a placeholder
-ships for plumbing tests).
-
+### Laptop dev (no Pi)
 ```bash
-python count.py config.pi.yaml     # live: passers / stops / conversion + SQLite log
-python report.py                   # summary: passers, stops, conversion, dwell avg/median/p90/max
+python -m pip install -r requirements.txt       # incl. ultralytics + supervision
+python detect_preview.py                        # config.yaml: cam0 = webcam, backend: cpu
 ```
-Annotated preview (tripwire + zone + HUD) lands in `data/annotated/<cam>.jpg`;
-every PASS/STOP event is logged to `data/counts.sqlite`.
 
-## LGPD note
+### The hub (VPS)
+```bash
+cd server
+cp .env.example .env      # COUNTER_TOKEN (openssl rand -hex 32) + COUNTER_USER / COUNTER_PASS
+docker compose up -d --build
+```
 
-Snapshots contain images of identifiable people → personal data under LGPD.
-Phase 5 bakes in: opt-in + rate-limited snapshots, auto-deletion after N days,
-optional face blur, and counts stored as anonymous aggregates. A posted notice
-at the counter + a documented retention policy are part of the deployment.
+## Build status
+
+- [x] **Edge capture + detection + tracking** — N-camera; Hailo (Pi) / CPU (dev).
+- [x] **Counting** — tripwire footfall + zone dwell with per-person duration;
+      conversion; events → `data/counts.sqlite`.
+- [x] **Hosted geometry + config editor** — draw / rotate / upload-image /
+      take-shot; parameters; pulled by the board on boot.
+- [x] **Central hub + dashboard** — conversion by date/time/place, images/vectors,
+      pagination, freshness, downloads, purge.
+- [x] **Privacy / LGPD** — on-device face pixelation, anonymous counts, retention,
+      date-range purge.
+- [x] **Service-ized** — systemd user services (auto-start + restart-on-failure).
+- [~] **Re-ID (pilot)** — clothing/body vectors + ephemeral matching window, under
+      validation; biometric modes gated.
+- [ ] **Boundary hand-off** for seam-straddling tracks (optional) + **360°**
+      (4 cameras via CM5 / USB).
