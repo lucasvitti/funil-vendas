@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply Wi-Fi credentials dropped on the boot partition (field provisioning)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wifi-from-bootfs.sh
+
+[Install]
+WantedBy=multi-user.target

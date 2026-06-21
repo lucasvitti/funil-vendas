@@ -1,0 +1,11 @@
+# Counting geometry per camera (image pixel coords, after rotation).
+# Drawn in tools/geometry_editor.html on the upright grab_frames output.
+#   tripwire: [[x1,y1],[x2,y2]]  — crossing it = a passer (footfall)
+#   zone:     [[x,y], ...]       — dwelling inside >= dwell_seconds = a stop
+geometry:
+  cam0:
+    tripwire: [[1072, 298], [1075, 835]]
+    zone: [[623, 421], [617, 849], [798, 844], [799, 423]]
+  cam1:
+    tripwire: [[751, 445], [754, 1081]]
+    zone: [[304, 640], [309, 1053], [470, 1053], [476, 643]]

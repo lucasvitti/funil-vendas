@@ -1,0 +1,15 @@
+services:
+  counter-api:
+    build: .
+    container_name: counter-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8095:8000"   # nginx reverse-proxies topofunil.lucas.mat.br -> here
+    environment:
+      COUNTER_DB: /data/counter.sqlite
+      COUNTER_TOKEN: ${COUNTER_TOKEN}
+      COUNTER_USER: ${COUNTER_USER:-lucas}
+      COUNTER_PASS: ${COUNTER_PASS}
+      COUNTER_RETAIN_DAYS: ${COUNTER_RETAIN_DAYS:-30}
+    volumes:
+      - ./data:/data            # SQLite persists on the host

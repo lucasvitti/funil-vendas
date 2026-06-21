@@ -1,0 +1,23 @@
+# User service (no sudo needed). Install:
+#   cp counter.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now counter.service
+#   loginctl enable-linger        # start at boot without login (already enabled)
+# Logs:  journalctl --user -u counter -f
+[Unit]
+Description=topofunil counter (count.py — cameras + Hailo + counting)
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/home/lucasvitti/counter_vision
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/lucasvitti/counter_vision/.venv/bin/python count.py config.pi.yaml
+# SIGINT so count.py's KeyboardInterrupt handler runs its finally (releases cameras)
+KillSignal=SIGINT
+TimeoutStopSec=15
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

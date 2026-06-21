@@ -1,0 +1,80 @@
+# Raspberry Pi production config: 2× wide CSI cameras (~180°) + Hailo detection.
+# Run:  python detect_preview.py config.pi.yaml
+
+location:
+  name: ""   # where this board is (store/site). Logged on every event, vector & saved
+             # image, and filterable on the dashboard. Set/update before moving the kiosk.
+             # The hosted editor (place / store name) overrides this when config is pulled.
+
+cameras:
+  - id: cam0
+    type: picamera2
+    source: 0            # CSI port 0 (imx708_wide)
+    width: 1536
+    height: 864          # 1536x864 binned mode — wide FOV, high fps, low noise
+    fps: 15
+    rotate: 0            # cam0: 0° = upright (manually confirmed)
+  - id: cam1
+    type: picamera2
+    source: 1            # CSI port 1 (imx708_wide)
+    width: 1536
+    height: 864
+    fps: 15
+    rotate: 90           # cam1: 90° = upright (manually confirmed)
+
+capture:
+  interval_seconds: 0.0  # run continuously (no throttle)
+  warmup_seconds: 2
+  jpeg_quality: 90
+
+output:
+  snapshots_dir: data/snapshots
+
+detection:
+  backend: hailo
+  confidence: 0.4
+  classes: [0]           # 0 = person (COCO)
+  hailo:
+    hef: /usr/share/hailo-models/yolov8s_h8l.hef   # verify path: ls /usr/share/hailo-models/
+
+counting:
+  geometry_file: geometry.yaml   # per-camera tripwire line + dwell zone
+  dwell_seconds: 1.8             # time in zone to count as a "stop"
+  track_cooldown_s: 1.5          # min gap before the same track re-counts a crossing
+  directional: true
+  boundary_dedup: true
+
+privacy:
+  face_mode: pixelate   # pixelate | box | blur | off  (obscures faces in saved frames - LGPD)
+  head_fraction: 0.28   # top fraction of each person box treated as the head
+  pixelate_blocks: 12   # mosaic coarseness (lower = blockier / more anonymous)
+
+events:
+  snapshot: both        # off | pass | stop | both  — one (face-obscured) snapshot per event
+  max_files: 400        # Pi keeps only the newest N (auto-prunes) so the SD can't fill
+  dir: data/events      # your laptop pulls + deletes from here (pull_events.ps1)
+
+server:                 # central server (topofunil)
+  enabled: true
+  url: https://topofunil.lucas.mat.br
+  device: pi-cam
+  upload_interval_s: 60
+  upload_events: true     # anonymous counts
+  upload_vectors: true    # re-ID vectors (centralized — keep DPO informed)
+  upload_images: true     # face-pixelated event snapshots
+  upload_frames: true     # reference frame per cam for the hosted geometry editor
+  delete_after_upload: true   # remove local images once on the VPS (keeps SD clean)
+  pull_config: true       # on boot, fetch params + geometry from the server (local = fallback)
+  reference_frame_s: 10   # how often to refresh the editor reference frame (seconds)
+  capture_poll_s: 0.75    # how often the board checks for an editor "take shot" request (lower = snappier)
+  # token: read from COUNTER_TOKEN env or ~/.counter_token on the Pi (NOT stored here)
+
+reid:                   # person re-identification (PILOT / study mode)
+  enabled: true
+  mode: body            # (3) body (clothing, LGPD-safe) | face | full  — face/full = biometric, gated
+  compare_window_s: 30  # (1) match a new vector against vectors from the last N seconds
+  retention_hours: 24   # (2) auto-erase stored vectors older than this
+  match_threshold: 0.35 # cosine distance below = same person (TUNE from reid_study.py)
+  suppress_duplicates: false  # study first; turn on after the threshold is validated
+  store_images: true    # (4) link each vector to its pixelated snapshot (never the original)
+  db: data/reid.sqlite

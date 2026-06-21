@@ -1,0 +1,17 @@
+# User service (no sudo needed). Install:
+#   cp counter-upload.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now counter-upload.service
+# Logs:  journalctl --user -u counter-upload -f
+[Unit]
+Description=topofunil uploader (upload_to_server.py — events/vectors/frames to VPS)
+
+[Service]
+Type=simple
+WorkingDirectory=/home/lucasvitti/counter_vision
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/lucasvitti/counter_vision/.venv/bin/python upload_to_server.py config.pi.yaml --loop
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

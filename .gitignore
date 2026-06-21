@@ -1,0 +1,29 @@
+# Captured frames / outputs — never commit images of people (LGPD)
+data/
+*.jpg
+*.jpeg
+*.png
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Models (downloaded, large)
+*.pt
+*.onnx
+*.hef
+
+# Secrets — NEVER commit (token lives in env / ~/.counter_token, .env on hosts)
+.env
+*.env
+.counter_token
+*.token
+*.key
+*.sqlite
+
+# Local backups / editor cruft
+*.bak
+*.bak-*

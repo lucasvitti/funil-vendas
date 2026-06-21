@@ -1,0 +1,17 @@
+# Core (laptop dev + Pi)
+opencv-python>=4.8
+numpy>=1.24
+PyYAML>=6.0
+supervision>=0.20        # ByteTrack tracking (detector-agnostic)
+
+# Laptop dev detection backend (cpu):
+ultralytics>=8.2         # YOLOv8 on CPU — needed only for the `cpu` backend
+
+# --- On the Raspberry Pi ---
+# Cameras + Hailo use SYSTEM packages (apt), NOT pip:
+#   sudo apt install -y python3-picamera2 hailo-all
+# The Hailo model ships with hailo-all (verify: ls /usr/share/hailo-models/).
+# Create the venv so it can see those system packages, then add supervision:
+#   python3 -m venv --system-site-packages .venv
+#   . .venv/bin/activate && pip install supervision
+# (ultralytics is NOT needed on the Pi — detection runs on the Hailo.)

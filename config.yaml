@@ -1,0 +1,67 @@
+# counter_vision configuration
+# Phase 1 uses the `cameras`, `capture`, and `output` sections.
+# Later sections are placeholders for Phases 2-5 (ignored for now).
+
+cameras:
+  # One entry per physical camera. For dev, point cam0 at your laptop webcam.
+  - id: cam0
+    type: usb          # usb | picamera2 | ai_camera  (only `usb` implemented in Phase 1)
+    source: 0          # USB device index, a /dev/videoN path, or an RTSP URL
+    backend: auto      # auto | dshow (Windows) | msmf (Windows) | v4l2 (Linux)
+    width: 1280
+    height: 720
+    fps: 30
+
+  # --- On the Pi (production): 2× wide CSI cameras for ~180° ---
+  # Replace cam0 above with these two (CSI, via picamera2):
+  # - id: cam0
+  #   type: picamera2
+  #   source: 0          # CSI port index (rpicam cam 0)
+  #   width: 1920
+  #   height: 1080
+  #   fps: 15
+  # - id: cam1
+  #   type: picamera2
+  #   source: 1          # CSI port index (rpicam cam 1)
+  #   width: 1920
+  #   height: 1080
+  #   fps: 15
+  #
+  # --- Future 360° (CM5+carrier, or imported USB modules): add cam2/cam3 ---
+  # The pipeline is N-camera; just add more entries here.
+
+capture:
+  interval_seconds: 5     # how often a frame-set is saved (Phase 1)
+  warmup_seconds: 2       # let auto-exposure settle before the first save
+  jpeg_quality: 90
+
+output:
+  snapshots_dir: data/snapshots
+
+# ---- Detection (Phase 2). This file = laptop dev (USB webcam + CPU). ----
+# The Pi uses config.pi.yaml (CSI cameras + Hailo).
+detection:
+  backend: cpu            # cpu (laptop dev) | hailo (AI HAT+, on the Pi)
+  confidence: 0.4
+  classes: [0]            # COCO ids; 0 = person
+  cpu:
+    model: yolov8n.pt     # ultralytics weights (auto-downloaded first run)
+  hailo:
+    hef: /usr/share/hailo-models/yolov8s_h8l.hef
+
+# Per-camera counting geometry is written by the Phase 3 editor. Each camera owns
+# a DISJOINT arc/segment of the counting boundary + its own dwell zones, e.g.:
+#   geometry:
+#     cam0:
+#       tripwire: [[x1, y1], [x2, y2]]   # footfall line (image pixels)
+#       zone: [[x, y], ...]              # dwell polygon (image pixels)
+counting:
+  dwell_seconds: 3.0       # time inside a zone to count as a "stop"
+  directional: true        # count crossings by direction (in vs out)
+  track_cooldown_s: 2.0    # min time before the same track ID can re-count
+  boundary_dedup: true     # optional seam hand-off for tracks straddling two cams
+
+privacy:
+  face_mode: pixelate      # pixelate | box | blur | off  (obscures faces in saved frames - LGPD)
+  head_fraction: 0.28      # top fraction of each person box treated as the head
+  pixelate_blocks: 12      # mosaic coarseness (lower = blockier / more anonymous)

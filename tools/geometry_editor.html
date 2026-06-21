@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<!--
+  counter_vision — Phase 3 geometry editor (client-side, no server).
+  1. Run grab_frames.py on the Pi, pull data/calib/<cam>.jpg to your laptop.
+  2. Open this file in a browser. Load a camera image, set its camera id.
+  3. Draw the TRIPWIRE LINE (2 clicks) and the DWELL ZONE (clicks + Finish zone).
+  4. "Save camera", repeat for the other camera, then "Export geometry.yaml".
+  Coordinates are in image pixels and match the capture resolution + rotation.
+-->
+<meta charset="utf-8">
+<title>counter_vision — geometry editor</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; color: #1a1a1a; }
+  #wrap { display: flex; gap: 16px; align-items: flex-start; }
+  #canvas { border: 1px solid #888; max-width: 70vw; cursor: crosshair; }
+  .panel { width: 320px; }
+  button, select, input { font-size: 14px; padding: 6px 8px; margin: 2px 0; }
+  button { cursor: pointer; }
+  .row { margin: 8px 0; }
+  .tag { display: inline-block; padding: 2px 6px; border-radius: 4px; color: #fff; font-size: 12px; }
+  .tline { background: #e6007a; } .tzone { background: #00a0a0; }
+  pre { background: #f4f4f4; padding: 10px; border-radius: 6px; white-space: pre-wrap; font-size: 12px; }
+  .hint { color: #666; font-size: 12px; }
+</style>
+
+<h2>counter_vision — counting geometry editor</h2>
+<div id="wrap">
+  <canvas id="canvas"></canvas>
+  <div class="panel">
+    <div class="row"><input type="file" id="file" accept="image/*"></div>
+    <div class="row">camera id: <input id="camid" value="cam0" size="8"></div>
+    <div class="row">
+      drawing:
+      <label><input type="radio" name="mode" value="line" checked> <span class="tag tline">tripwire line</span></label>
+      <label><input type="radio" name="mode" value="zone"> <span class="tag tzone">dwell zone</span></label>
+    </div>
+    <div class="row hint">Line = 2 clicks (direction = first→second). Zone = click each corner, then Finish zone.</div>
+    <div class="row">
+      <button id="finishZone">Finish zone</button>
+      <button id="undo">Undo point</button>
+      <button id="clear">Clear this camera</button>
+    </div>
+    <div class="row"><button id="save">💾 Save camera</button> <span id="saved" class="hint"></span></div>
+    <hr>
+    <div class="row"><button id="export">⬇ Export geometry.yaml</button> <button id="download">Download</button></div>
+    <pre id="out">geometry: {}</pre>
+  </div>
+</div>
+
+<script>
+const cv = document.getElementById('canvas'), ctx = cv.getContext('2d');
+let img = null, line = [], zone = [], saved = {};
+
+function mode() { return document.querySelector('input[name=mode]:checked').value; }
+
+document.getElementById('file').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  const im = new Image();
+  im.onload = () => { img = im; cv.width = im.naturalWidth; cv.height = im.naturalHeight; line = []; zone = []; draw(); };
+  im.src = URL.createObjectURL(f);
+};
+
+cv.onclick = e => {
+  if (!img) return;
+  const r = cv.getBoundingClientRect();
+  const x = Math.round((e.clientX - r.left) * (cv.width / r.width));
+  const y = Math.round((e.clientY - r.top) * (cv.height / r.height));
+  if (mode() === 'line') { if (line.length >= 2) line = []; line.push([x, y]); }
+  else zone.push([x, y]);
+  draw();
+};
+
+document.getElementById('finishZone').onclick = () => draw();
+document.getElementById('undo').onclick = () => { (mode() === 'line' ? line : zone).pop(); draw(); };
+document.getElementById('clear').onclick = () => { line = []; zone = []; draw(); };
+
+document.getElementById('save').onclick = () => {
+  const id = document.getElementById('camid').value.trim();
+  if (!id) return alert('set a camera id');
+  if (line.length !== 2) return alert('draw a 2-point tripwire line first');
+  if (zone.length < 3) return alert('draw a dwell zone (3+ points) first');
+  saved[id] = { tripwire: line.slice(), zone: zone.slice() };
+  document.getElementById('saved').textContent = 'saved: ' + Object.keys(saved).join(', ');
+  exportYaml();
+};
+
+function exportYaml() {
+  let s = 'geometry:\n';
+  if (!Object.keys(saved).length) s = 'geometry: {}';
+  for (const [id, g] of Object.entries(saved)) {
+    const j = a => '[' + a.map(p => `[${p[0]}, ${p[1]}]`).join(', ') + ']';
+    s += `  ${id}:\n    tripwire: ${j(g.tripwire)}\n    zone: ${j(g.zone)}\n`;
+  }
+  document.getElementById('out').textContent = s;
+  return s;
+}
+document.getElementById('export').onclick = exportYaml;
+document.getElementById('download').onclick = () => {
+  const blob = new Blob([exportYaml()], { type: 'text/yaml' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'geometry.yaml'; a.click();
+};
+
+function draw() {
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  if (img) ctx.drawImage(img, 0, 0);
+  // zone (filled polygon)
+  if (zone.length) {
+    ctx.beginPath(); ctx.moveTo(zone[0][0], zone[0][1]);
+    zone.forEach(p => ctx.lineTo(p[0], p[1]));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(0,160,160,0.25)'; ctx.fill();
+    ctx.strokeStyle = '#00a0a0'; ctx.lineWidth = 3; ctx.stroke();
+    zone.forEach(p => dot(p, '#00a0a0'));
+  }
+  // line with direction arrow
+  if (line.length) {
+    ctx.strokeStyle = '#e6007a'; ctx.lineWidth = 4; ctx.beginPath();
+    ctx.moveTo(line[0][0], line[0][1]);
+    if (line[1]) ctx.lineTo(line[1][0], line[1][1]);
+    ctx.stroke();
+    line.forEach(p => dot(p, '#e6007a'));
+    if (line[1]) arrow(line[0], line[1]);
+  }
+}
+function dot(p, c) { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(p[0], p[1], 6, 0, 7); ctx.fill(); }
+function arrow(a, b) {
+  const ang = Math.atan2(b[1] - a[1], b[0] - a[0]), L = 18;
+  ctx.fillStyle = '#e6007a'; ctx.beginPath();
+  ctx.moveTo(b[0], b[1]);
+  ctx.lineTo(b[0] - L * Math.cos(ang - 0.4), b[1] - L * Math.sin(ang - 0.4));
+  ctx.lineTo(b[0] - L * Math.cos(ang + 0.4), b[1] - L * Math.sin(ang + 0.4));
+  ctx.closePath(); ctx.fill();
+}
+</script>
