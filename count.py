@@ -22,8 +22,8 @@ import supervision as sv
 from src.cameras import build_camera
 from src.config import load_config
 from src.counting.counter import CameraCounter
-from src.counting.geometry import load_geometry
-from src.detect import build_detector, to_sv
+from src.counting.geometry import centroid, load_geometry, parse_tripwires
+from src.detect import build_detector, coco_name, to_sv
 from src.privacy import obscure_heads
 from src import reid, server_config
 
@@ -50,25 +50,42 @@ def foot_point(xyxy):
     return ((x1 + x2) / 2.0, float(y2))
 
 
+def person_boxes(tracked):
+    """Only person (COCO class 0) boxes — faces are obscured for people only (LGPD);
+    cats / objects have no face to pixelate. Falls back to all boxes if class is absent."""
+    cls = tracked.class_id
+    if cls is None:
+        return tracked.xyxy
+    return tracked.xyxy[cls == 0]
+
+
 def draw(image, geom, tracked, counter, privacy, place=""):
     img = image.copy()
     # Privacy first: obscure faces on the raw content before anything is drawn,
-    # so the saved frame never contains an identifiable face (LGPD).
-    obscure_heads(img, tracked.xyxy, **privacy)
+    # so the saved frame never contains an identifiable face (LGPD). People only.
+    obscure_heads(img, person_boxes(tracked), **privacy)
     if geom.get("zone"):
         pts = np.array(geom["zone"], dtype=int).reshape(-1, 1, 2)
         overlay = img.copy()
         cv2.fillPoly(overlay, [pts], ZONE_COLOR)
         img = cv2.addWeighted(overlay, 0.22, img, 0.78, 0)
         cv2.polylines(img, [pts], True, ZONE_COLOR, 2)
-    if geom.get("tripwire"):
-        a, b = geom["tripwire"]
+    cz = centroid(geom.get("zone", []))
+    for a, b in parse_tripwires(geom):
         cv2.line(img, tuple(map(int, a)), tuple(map(int, b)), LINE_COLOR, 3)
-    for box, tid in zip(tracked.xyxy, tracked.tracker_id):
+        if cz:  # arrow from the segment midpoint toward the zone = "inward" (entry direction)
+            mx, my = (a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0
+            dx, dy = cz[0] - mx, cz[1] - my
+            L = (dx * dx + dy * dy) ** 0.5 or 1.0
+            cv2.arrowedLine(img, (int(mx), int(my)),
+                            (int(mx + dx / L * 32), int(my + dy / L * 32)),
+                            LINE_COLOR, 2, tipLength=0.45)
+    clsid = tracked.class_id if tracked.class_id is not None else [0] * len(tracked.xyxy)
+    for box, tid, cid in zip(tracked.xyxy, tracked.tracker_id, clsid):
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.circle(img, ((x1 + x2) // 2, y2), 5, (0, 140, 255), -1)  # foot point
-        cv2.putText(img, f"#{int(tid)}", (x1, max(0, y1 - 6)),
+        cv2.putText(img, f"{coco_name(cid)} #{int(tid)}", (x1, max(0, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
     hud = f"passers {counter.passers}  stops {counter.stops}  conv {counter.conversion * 100:.0f}%"
     cv2.putText(img, hud, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
@@ -118,6 +135,8 @@ def main(config_path: str | None = None) -> int:
     geometry = server_geom if server_geom else load_geometry(ccfg.get("geometry_file", "geometry.yaml"))
     dwell_s = float(ccfg.get("dwell_seconds", 3.0))
     cooldown = float(ccfg.get("track_cooldown_s", 2.0))
+    cross_mode = ccfg.get("cross_mode", "inward")   # inward = count entries only
+    log_crossings = bool(ccfg.get("log_crossings", True))   # record every crossing as a "cross" event
 
     pcfg = cfg.get("privacy", {})
     privacy = {
@@ -137,9 +156,11 @@ def main(config_path: str | None = None) -> int:
         cam.open()
     trackers = {c.cam_id: sv.ByteTrack() for c in cameras}
     counters = {
-        c.cam_id: CameraCounter(c.cam_id, geometry.get(c.cam_id, {}), dwell_s, cooldown)
+        c.cam_id: CameraCounter(c.cam_id, geometry.get(c.cam_id, {}), dwell_s, cooldown,
+                                cross_mode=cross_mode, log_crossings=log_crossings)
         for c in cameras
     }
+    print(f"counting: cross_mode={cross_mode} log_crossings={log_crossings}")
     for c in cameras:
         if not geometry.get(c.cam_id):
             print(f"  [warn] no geometry for {c.cam_id} — draw it with the editor + geometry.yaml")
@@ -148,8 +169,12 @@ def main(config_path: str | None = None) -> int:
     db = sqlite3.connect("data/counts.sqlite")
     db.execute(
         "CREATE TABLE IF NOT EXISTS events "
-        "(ts TEXT, cam TEXT, type TEXT, track INTEGER, dwell REAL)"
+        "(ts TEXT, cam TEXT, type TEXT, track INTEGER, dwell REAL, direction TEXT, seg INTEGER, object TEXT)"
     )
+    _ecols = [r[1] for r in db.execute("PRAGMA table_info(events)")]
+    for _c, _d in (("direction", "TEXT"), ("seg", "INTEGER"), ("object", "TEXT")):
+        if _c not in _ecols:
+            db.execute(f"ALTER TABLE events ADD COLUMN {_c} {_d}")
     db.commit()
     ann = Path("data/annotated")
     ann.mkdir(parents=True, exist_ok=True)
@@ -206,9 +231,10 @@ def main(config_path: str | None = None) -> int:
                 tracked = trackers[cam.cam_id].update_with_detections(
                     to_sv(detector.detect(frame.image))
                 )
+                clsid = tracked.class_id if tracked.class_id is not None else [0] * len(tracked.xyxy)
                 dets = [
-                    (int(tid), foot_point(box))
-                    for box, tid in zip(tracked.xyxy, tracked.tracker_id)
+                    (int(tid), foot_point(box), int(cid))
+                    for box, tid, cid in zip(tracked.xyxy, tracked.tracker_id, clsid)
                 ]
                 counter = counters[cam.cam_id]
                 evs = counter.update(dets, now)
@@ -217,7 +243,7 @@ def main(config_path: str | None = None) -> int:
 
                 if write_frames and (capture_now or now - last_ref.get(cam.cam_id, 0.0) > ref_interval):
                     ref = frame.image.copy()
-                    obscure_heads(ref, tracked.xyxy, **privacy)  # never an identifiable face
+                    obscure_heads(ref, person_boxes(tracked), **privacy)  # people only — never a face
                     ref = unrotate(ref, getattr(cam, "rotate", 0))  # raw orientation; editor rotates
                     cv2.imwrite(str(frames_dir / f"{cam.cam_id}.jpg"), ref)
                     last_ref[cam.cam_id] = now
@@ -232,17 +258,19 @@ def main(config_path: str | None = None) -> int:
 
                 for e in evs:
                     db.execute(
-                        "INSERT INTO events VALUES (?,?,?,?,?)",
+                        "INSERT INTO events VALUES (?,?,?,?,?,?,?,?)",
                         (datetime.now().isoformat(timespec="seconds"),
-                         e.cam_id, e.type, e.track_id, round(e.dwell, 2)),
+                         e.cam_id, e.type, e.track_id, round(e.dwell, 2), e.direction, e.seg,
+                         coco_name(e.cls)),
                     )
                     db.commit()
                     print(f"  >> {e.type.upper()} {cam.cam_id} #{e.track_id}"
-                          + (f" dwell={e.dwell:.1f}s" if e.type == "stop" else ""))
+                          + (f" dwell={e.dwell:.1f}s" if e.type == "stop"
+                             else f" {e.direction} seg{e.seg}"))
                     snap_name = None
-                    if snap_mode == "both" or e.type == snap_mode:
+                    if e.type != "cross" and (snap_mode == "both" or e.type == snap_mode):
                         snap_name = save_event_snapshot(events_dir, e, annotated, snap_max)
-                    if reid_store is not None:
+                    if reid_store is not None and e.type != "cross":
                         box = box_by_track.get(e.track_id)
                         if box is not None:
                             info = reid.extract(frame.image, box, reid_mode)

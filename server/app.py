@@ -87,7 +87,8 @@ def _db():
     con = sqlite3.connect(DB)
     con.execute(
         "CREATE TABLE IF NOT EXISTS events("
-        "device TEXT, ts TEXT, cam TEXT, type TEXT, track INTEGER, dwell REAL, place TEXT)"
+        "device TEXT, ts TEXT, cam TEXT, type TEXT, track INTEGER, dwell REAL, place TEXT, "
+        "direction TEXT, seg INTEGER, object TEXT)"
     )
     con.execute(
         "CREATE TABLE IF NOT EXISTS configs(device TEXT PRIMARY KEY, body TEXT, updated TEXT)"
@@ -99,6 +100,9 @@ def _db():
         "image TEXT, match_track INTEGER, match_dist REAL, received TEXT, place TEXT)"
     )
     _ensure_col(con, "events", "place")
+    _ensure_col(con, "events", "direction")
+    _ensure_col(con, "events", "seg", "INTEGER")
+    _ensure_col(con, "events", "object")
     _ensure_col(con, "vectors", "place")
     return con
 
@@ -180,9 +184,10 @@ async def post_events(request: Request, authorization: str = Header(None)):
     rows = payload.get("events", [])
     con = _db()
     con.executemany(
-        "INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?)",
         [(device, e["ts"], e["cam"], e["type"], e.get("track"), e.get("dwell", 0.0),
-          e.get("place", "")) for e in rows],
+          e.get("place", ""), e.get("direction", ""), e.get("seg", -1),
+          e.get("object", "")) for e in rows],
     )
     con.commit()
     con.close()
@@ -201,7 +206,7 @@ def _bucket_sql(gran):
             f"printf('%02d', (CAST(strftime('%M', ts) AS INTEGER)/{gran})*{gran})")
 
 
-def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None):
+def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None, obj=None):
     """Aggregate conversion straight from the event rows, filtered by date range
     (and place) and bucketed to `gran` minutes. Date is part of each bucket."""
     gran = gran if gran in _GRAN_MIN else 60
@@ -215,16 +220,24 @@ def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None):
     if d_to:
         where.append("date(ts) <= ?"); args.append(d_to)
     wsql = (" WHERE " + " AND ".join(where)) if where else ""
+    # the conversion view only looks at pass/stop; raw 'cross' rows are CSV-only telemetry.
+    # object lives only on events (not vectors), so it filters ev_* not the shared args.
+    ev_where = where + ["type IN ('pass','stop')"]
+    ev_args = list(args)
+    if obj:
+        ev_where.append("object = ?"); ev_args.append(obj)
+    ev_wsql = " WHERE " + " AND ".join(ev_where)
     con = _db()
     tot = con.execute(
         "SELECT SUM(type='pass'), SUM(type='stop'), "
         "AVG(CASE WHEN type='stop' THEN dwell END), MAX(CASE WHEN type='stop' THEN dwell END), "
-        "COUNT(*), MIN(ts), MAX(ts) FROM events" + wsql, args).fetchone()
+        "COUNT(*), MIN(ts), MAX(ts) FROM events" + ev_wsql, ev_args).fetchone()
     b = _bucket_sql(gran)
     brows = con.execute(
         f"SELECT {b} AS bkt, SUM(type='pass'), SUM(type='stop'), "
-        f"AVG(CASE WHEN type='stop' THEN dwell END), GROUP_CONCAT(DISTINCT NULLIF(place,'')) "
-        f"FROM events{wsql} GROUP BY bkt ORDER BY bkt", args).fetchall()
+        f"AVG(CASE WHEN type='stop' THEN dwell END), GROUP_CONCAT(DISTINCT NULLIF(place,'')), "
+        f"GROUP_CONCAT(DISTINCT NULLIF(object,'')) "
+        f"FROM events{ev_wsql} GROUP BY bkt ORDER BY bkt", ev_args).fetchall()
     # vectors saved per bucket — same WHERE works (vectors has device/place/ts too)
     vrows = con.execute(
         f"SELECT {b} AS bkt, COUNT(*) FROM vectors{wsql} GROUP BY bkt", args).fetchall()
@@ -232,10 +245,10 @@ def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None):
     vecmap = {r[0]: r[1] for r in vrows}
     imgmap = _images_per_bucket(device, gran, d_from, d_to)  # snapshot files by filename ts
     rows = []
-    for bkt, p, s, dav, pl in brows:
+    for bkt, p, s, dav, pl, obn in brows:
         p, s = p or 0, s or 0
         rows.append({"date": (bkt or "")[:10], "time": (bkt or "")[11:16],
-                     "place": pl or "", "passers": p, "stops": s,
+                     "place": pl or "", "object": obn or "", "passers": p, "stops": s,
                      "conversion_pct": round(s / p * 100, 1) if p else 0.0,
                      "dwell_avg": round(dav, 1) if dav is not None else None,
                      "images": imgmap.get(bkt, 0), "vectors": vecmap.get(bkt, 0)})
@@ -248,7 +261,7 @@ def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None):
         overall["dwell_s"] = {"avg": round(tot[2], 1), "max": round(tot[3], 1)}
     return {
         "device": device or "all",
-        "filter": {"from": d_from or None, "to": d_to or None, "gran": gran, "place": place or None},
+        "filter": {"from": d_from or None, "to": d_to or None, "gran": gran, "place": place or None, "object": obj or None},
         "period": {"from": tot[5], "to": tot[6]} if n else None,
         "events": n,
         "vectors": total_vectors,
@@ -261,9 +274,9 @@ def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None):
 @app.get("/api/report")
 def report(device: str = None, authorization: str = Header(None),
            from_: str = Query(None, alias="from"), to: str = Query(None),
-           gran: int = Query(60), place: str = Query(None)):
+           gran: int = Query(60), place: str = Query(None), obj: str = Query(None, alias="object")):
     _auth(authorization)
-    return _report_data(device, from_, to, gran, place)
+    return _report_data(device, from_, to, gran, place, obj)
 
 
 @app.get("/api/config/{device}")
@@ -399,14 +412,15 @@ async def post_snapshots(request: Request, authorization: str = Header(None)):
 def events_csv(request: Request, device: str = None, authorization: str = Header(None), token: str = Query(None)):
     _auth_ui(request, authorization, token)
     con = _db()
-    q = "SELECT device, place, ts, cam, type, track, dwell FROM events"
+    q = "SELECT device, place, object, ts, cam, type, track, dwell, direction, seg FROM events"
     args = []
     if device:
         q += " WHERE device = ?"
         args = [device]
     rows = con.execute(q + " ORDER BY ts", args).fetchall()
     con.close()
-    return _csv(rows, ["device", "place", "ts", "cam", "type", "track", "dwell"], "events.csv")
+    return _csv(rows, ["device", "place", "object", "ts", "cam", "type", "track", "dwell", "direction", "seg"],
+                "events.csv")
 
 
 @app.get("/api/vectors.csv")
@@ -562,17 +576,18 @@ def _freshness_html(device):
     return live, (last_ev or "&mdash;")
 
 
-def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None):
-    rep = _report_data(device, d_from, d_to, gran, place)
+def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None, obj=None):
+    rep = _report_data(device, d_from, d_to, gran, place, obj)
     o = rep["overall"]
     fl = rep["filter"]
     body = ""
     for a in rep.get("rows", []):
         body += (f"<tr><td>{a['date']}</td><td>{a['time']}</td><td>{_esc(a.get('place') or '—')}</td>"
+                 f"<td>{_esc(a.get('object') or '—')}</td>"
                  f"<td>{a['passers']}</td><td>{a['stops']}</td><td>{a['conversion_pct']}%</td>"
                  f"<td>{a['images']}</td><td>{a['vectors']}</td></tr>")
     if not body:
-        body = "<tr><td colspan=8 style='text-align:center;color:#999'>no events in this range</td></tr>"
+        body = "<tr><td colspan=9 style='text-align:center;color:#999'>no events in this range</td></tr>"
     p = rep.get("period")
     per = f"{p['from']} &rarr; {p['to']}" if p else "&mdash;"
     nb = len(rep.get("rows", []))
@@ -587,9 +602,18 @@ def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None):
     psel = "<option value=''>all places</option>" + "".join(
         f'<option value="{_esc(pl)}"{" selected" if pl == cur_place else ""}>{_esc(pl)}</option>'
         for pl in places)
+    con = _db()
+    objs = [r[0] for r in con.execute(
+        "SELECT DISTINCT object FROM events WHERE device=? AND object IS NOT NULL AND object!='' "
+        "ORDER BY object", (device,))]
+    con.close()
+    cur_obj = fl.get("object") or ""
+    osel = "<option value=''>all objects</option>" + "".join(
+        f'<option value="{_esc(o2)}"{" selected" if o2 == cur_obj else ""}>{_esc(o2)}</option>'
+        for o2 in objs)
     vf, vt = fl["from"] or "", fl["to"] or ""
     live, latest = _freshness_html(device)
-    qs = f"device={device}&amp;from={vf}&amp;to={vt}&amp;gran={fl['gran']}&amp;place={_esc(cur_place)}"
+    qs = f"device={device}&amp;from={vf}&amp;to={vt}&amp;gran={fl['gran']}&amp;place={_esc(cur_place)}&amp;object={_esc(cur_obj)}"
     return f"""<!doctype html><meta charset=utf-8><title>topofunil</title>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <style>
@@ -609,7 +633,7 @@ def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None):
  form.flt button{{padding:7px 14px;background:#0a7;color:#fff;border:0;border-radius:5px;cursor:pointer;font-size:14px}}
  table{{border-collapse:collapse;margin-top:10px;width:100%;font-size:14px}}
  td,th{{border:1px solid #ddd;padding:5px 9px;text-align:right}} th{{background:#f4f4f4}}
- td:first-child,th:first-child,td:nth-child(2),th:nth-child(2),td:nth-child(3),th:nth-child(3){{text-align:left}}
+ td:first-child,th:first-child,td:nth-child(2),th:nth-child(2),td:nth-child(3),th:nth-child(3),td:nth-child(4),th:nth-child(4){{text-align:left}}
  a.btn{{display:inline-block;margin:4px 8px 4px 0;padding:9px 13px;background:#0a7;color:#fff;
   text-decoration:none;border-radius:5px;font-size:14px}}
  .purge{{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:6px;padding:10px 12px;
@@ -634,6 +658,7 @@ def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None):
  <label>to<input type=date name=to value="{vt}"></label>
  <label>granularity<select name=gran>{gsel}</select></label>
  <label>place<select name=place>{psel}</select></label>
+ <label>object<select name=object>{osel}</select></label>
  <button type=submit>Apply</button>
 </form>
 <p style=color:#888;font-size:13px>range: {per} &middot; {rep['events']} events &middot; {rep['vectors']} vectors &middot; {rep['images']} images &middot; {nb} buckets</p>
@@ -647,7 +672,7 @@ def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None):
 <a class=btn href="/api/vectors.csv?device={device}">Vectors CSV</a>
 <a class=btn href="/api/snapshots.zip?device={device}">Images ZIP</a>
 <h3>Conversion by {fl['gran']}-min bucket</h3>
-<table><thead><tr><th>date</th><th>time</th><th>place</th><th>passers</th><th>stops</th><th>conversion</th><th>images</th><th>vectors</th></tr></thead><tbody id=tb>{body}</tbody></table>
+<table><thead><tr><th>date</th><th>time</th><th>place</th><th>object</th><th>passers</th><th>stops</th><th>conversion</th><th>images</th><th>vectors</th></tr></thead><tbody id=tb>{body}</tbody></table>
 <div id=pgnav><button onclick=pgPrev()>&lsaquo; prev</button> <span id=pgind></span> <button onclick=pgNext()>next &rsaquo;</button></div>
 <h3>Purge data (LGPD)</h3>
 <p style="color:#888;font-size:12px;margin:2px 0">Permanently delete re-ID vectors and face-pixelated images in a date range (this device). Anonymous counts are kept. Empty dates = all.</p>
@@ -723,10 +748,10 @@ def logout():
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, device: str = "pi-cam",
               from_: str = Query(None, alias="from"), to: str = Query(None),
-              gran: int = Query(60), place: str = Query(None)):
+              gran: int = Query(60), place: str = Query(None), obj: str = Query(None, alias="object")):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(_dashboard_html(device, from_, to, gran, place))
+    return HTMLResponse(_dashboard_html(device, from_, to, gran, place, obj))
 
 
 _EDITOR_HTML = """<!doctype html><meta charset=utf-8><title>topofunil — geometry &amp; config</title>
@@ -773,7 +798,7 @@ _EDITOR_HTML = """<!doctype html><meta charset=utf-8><title>topofunil — geomet
 <div class=ctl>cameras: <input id=cams value="cam0,cam1"> <button onclick=rebuild()>rebuild</button>
  <button onclick=loadCfg()>load current</button>
  <button id=shotbtn onclick=takeShot()>📷 take shot (all)</button>
- <span style=color:#888>rotate to upright first, then: tripwire = 2 clicks (first→second = direction) · zone = click each corner</span></div>
+ <span style=color:#888>rotate to upright first, then: tripwire = 2 clicks per segment (add one per approach) · zone = click each corner</span></div>
 <div id=camwrap></div>
 
 <fieldset><legend>parameters</legend>
@@ -785,8 +810,11 @@ _EDITOR_HTML = """<!doctype html><meta charset=utf-8><title>topofunil — geomet
 <div class=pcat>Detection &amp; counting</div>
 <div class=grid>
  <label>Detection confidence (0-1) <input id=confidence type=number step=0.05 min=0 max=1></label>
+ <label>Detect <select id=detect><option>person</option><option>cat</option><option>dog</option><option>banana</option><option>umbrella</option></select></label>
  <label>Dwell time for a "stop" (s) <input id=dwell_seconds type=number step=0.1></label>
  <label>Re-count cooldown (s) <input id=track_cooldown_s type=number step=0.1></label>
+ <label>Crossing count <select id=cross_mode><option value=inward>inward (entries only)</option><option value=any>any direction</option></select></label>
+ <label>Log every crossing <input id=log_crossings type=checkbox></label>
 </div>
 <div class=pcat>Privacy (LGPD)</div>
 <div class=grid>
@@ -847,7 +875,7 @@ function rebuild(){
   const cw=document.createElement('div'); cw.className='cvwrap';
   const cvs=document.createElement('canvas'); cvs.id='cv_'+id; cvs.width=960; cvs.height=540;
   cw.appendChild(cvs); div.appendChild(cw); wrap.appendChild(div);
-  const st={line:prev?prev.line:[], zone:prev?prev.zone:[], rot:prev?prev.rot:0, zoom:z0, collapsed:prev?prev.collapsed:false, canvas:cvs, ctx:cvs.getContext('2d'), img:null};
+  const st={lines:prev?prev.lines:[], pend:prev?prev.pend:[], zone:prev?prev.zone:[], rot:prev?prev.rot:0, zoom:z0, collapsed:prev?prev.collapsed:false, canvas:cvs, ctx:cvs.getContext('2d'), img:null};
   cams[id]=st;
   if(st.collapsed)div.classList.add('collapsed');
   h.onclick=()=>{st.collapsed=!st.collapsed; div.classList.toggle('collapsed',st.collapsed);};
@@ -860,7 +888,7 @@ function rebuild(){
    const x=Math.round((ev.clientX-r.left)*(cvs.width/r.width));
    const y=Math.round((ev.clientY-r.top)*(cvs.height/r.height));
    const m=document.querySelector('input[name=mode_'+id+']:checked').value;
-   if(m==='line'){if(st.line.length>=2)st.line=[];st.line.push([x,y]);} else st.zone.push([x,y]);
+   if(m==='line'){st.pend.push([x,y]); if(st.pend.length===2){st.lines.push(st.pend); st.pend=[];}} else st.zone.push([x,y]);
    render(id);
   };
   render(id);
@@ -871,10 +899,11 @@ function rot(id){const st=cams[id];
  const iw=st.img?st.img.naturalWidth:960, ih=st.img?st.img.naturalHeight:540;
  const H=(st.rot===90||st.rot===270)?iw:ih;   // old canvas height
  const xf=p=>[H-p[1],p[0]];
- st.line=st.line.map(xf); st.zone=st.zone.map(xf);
+ st.lines=st.lines.map(s=>s.map(xf)); st.pend=st.pend.map(xf); st.zone=st.zone.map(xf);
  st.rot=(st.rot+90)%360; render(id);}
-function undo(id){const st=cams[id];const m=document.querySelector('input[name=mode_'+id+']:checked').value;(m==='line'?st.line:st.zone).pop();render(id);}
-function clr(id){cams[id].line=[];cams[id].zone=[];render(id);}
+function undo(id){const st=cams[id];const m=document.querySelector('input[name=mode_'+id+']:checked').value;
+ if(m==='line'){if(st.pend.length)st.pend.pop(); else st.lines.pop();} else st.zone.pop(); render(id);}
+function clr(id){cams[id].lines=[];cams[id].pend=[];cams[id].zone=[];render(id);}
 // display-only scale: canvas internal resolution stays at the original image
 // size, so tripwire/zone coordinates are always in original pixels.
 function zoom(id,v){const st=cams[id]; if(!st)return; st.zoom=+v; st.canvas.style.width=v+'%';
@@ -918,6 +947,11 @@ async function takeShot(){
 }
 
 function dot(ctx,p,c){ctx.fillStyle=c;ctx.beginPath();ctx.arc(p[0],p[1],6,0,7);ctx.fill();}
+function arrow(ctx,x1,y1,x2,y2,c){ctx.strokeStyle=c;ctx.fillStyle=c;ctx.lineWidth=2;
+ ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();
+ const a=Math.atan2(y2-y1,x2-x1),h=9;
+ ctx.beginPath();ctx.moveTo(x2,y2);ctx.lineTo(x2-h*Math.cos(a-0.5),y2-h*Math.sin(a-0.5));
+ ctx.lineTo(x2-h*Math.cos(a+0.5),y2-h*Math.sin(a+0.5));ctx.closePath();ctx.fill();}
 function render(id){
  const st=cams[id], ctx=st.ctx, cvs=st.canvas, rot=st.rot;
  const iw=st.img?st.img.naturalWidth:960, ih=st.img?st.img.naturalHeight:540;
@@ -934,19 +968,25 @@ function render(id){
  if(st.zone.length){ctx.beginPath();ctx.moveTo(st.zone[0][0],st.zone[0][1]);st.zone.forEach(p=>ctx.lineTo(p[0],p[1]));
   ctx.closePath();ctx.fillStyle='rgba(0,160,160,0.25)';ctx.fill();ctx.strokeStyle='#00a0a0';ctx.lineWidth=3;ctx.stroke();
   st.zone.forEach(p=>dot(ctx,p,'#00a0a0'));}
- if(st.line.length){ctx.strokeStyle='#e6007a';ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(st.line[0][0],st.line[0][1]);
-  if(st.line[1])ctx.lineTo(st.line[1][0],st.line[1][1]);ctx.stroke();st.line.forEach(p=>dot(ctx,p,'#e6007a'));}
- const el=document.getElementById('pts_'+id); if(el)el.textContent=' rot '+rot+'° · tripwire '+st.line.length+'/2 · zone '+st.zone.length+' pts';
+ ctx.strokeStyle='#e6007a';ctx.lineWidth=4;
+ st.lines.forEach(seg=>{ctx.beginPath();ctx.moveTo(seg[0][0],seg[0][1]);ctx.lineTo(seg[1][0],seg[1][1]);ctx.stroke();seg.forEach(p=>dot(ctx,p,'#e6007a'));});
+ st.pend.forEach(p=>dot(ctx,p,'#e6007a'));
+ if(st.zone.length>=3){const cx=st.zone.reduce((a,p)=>a+p[0],0)/st.zone.length,cy=st.zone.reduce((a,p)=>a+p[1],0)/st.zone.length;
+  st.lines.forEach(seg=>{const mx=(seg[0][0]+seg[1][0])/2,my=(seg[0][1]+seg[1][1])/2;let dx=cx-mx,dy=cy-my;const L=Math.hypot(dx,dy)||1;arrow(ctx,mx,my,mx+dx/L*34,my+dy/L*34,'#e6007a');});}
+ const el=document.getElementById('pts_'+id); if(el)el.textContent=' rot '+rot+'° · tripwires '+st.lines.length+(st.pend.length?' (+1 pending)':'')+' · zone '+st.zone.length+' pts';
 }
 
-const PARAMS=['place_name','dwell_seconds','track_cooldown_s','confidence','face_mode','reid_enabled','reid_mode','compare_window_s','retention_hours','match_threshold','store_images','upload_events','upload_vectors','upload_images','capture_poll_s','reference_frame_s'];
-const BOOLS=['reid_enabled','store_images','upload_events','upload_vectors','upload_images'];
+const PARAMS=['place_name','dwell_seconds','track_cooldown_s','cross_mode','log_crossings','confidence','detect','face_mode','reid_enabled','reid_mode','compare_window_s','retention_hours','match_threshold','store_images','upload_events','upload_vectors','upload_images','capture_poll_s','reference_frame_s'];
+const BOOLS=['reid_enabled','store_images','upload_events','upload_vectors','upload_images','log_crossings'];
 const NUMS=['dwell_seconds','track_cooldown_s','confidence','compare_window_s','retention_hours','match_threshold','capture_poll_s','reference_frame_s'];
 const HINTS={
  place_name:'Where this board is located (store/site name). Logged on every event, vector, and saved image; filterable on the dashboard. Set it before moving the kiosk.',
  dwell_seconds:'Seconds a person must stay inside the zone to count as a "stop" (dwell).',
  track_cooldown_s:'Minimum gap before the same tracked person can re-trigger a tripwire crossing.',
+ cross_mode:'Which crossings count as a passer: "inward" = only entries toward the zone (cleaner funnel, stops ⊆ passers) · "any" = both directions. Direction is recorded on every counted crossing either way.',
+ log_crossings:'Also log EVERY tripwire crossing as a "cross" event (direction in/out + segment) — full directional flow in the CSV, separate from the counted footfall. Off = only footfall + stops.',
  confidence:'Detector confidence threshold (0–1). Higher = fewer false detections but may miss people.',
+ detect:'What the detector looks for (one COCO class). person/cat/dog for the usual tests, plus a few oddballs for fun. Everything is tracked/counted the same way.',
  face_mode:'How faces are obscured before any frame is saved or uploaded (LGPD): pixelate · box · blur · off.',
  reid_enabled:'Enable person re-identification (clothing/body vector). Pilot / study mode — no suppression.',
  reid_mode:'Re-ID feature: body = clothing (LGPD-safe) · face / full = biometric (gated).',
@@ -967,9 +1007,10 @@ function wireHints(){const h=document.getElementById('hint'); const dflt=h.textC
   lab.addEventListener('mouseenter',show); lab.addEventListener('mouseleave',clear);
   el.addEventListener('focus',show); el.addEventListener('blur',clear);}}
 // starting values when the server has nothing saved (mirror config.pi.yaml)
-const DEFAULTS={place_name:'',dwell_seconds:1.8,track_cooldown_s:1.5,confidence:0.4,face_mode:'pixelate',
+const DEFAULTS={place_name:'',dwell_seconds:1.8,track_cooldown_s:1.5,cross_mode:'inward',confidence:0.4,detect:'person',face_mode:'pixelate',
  reid_enabled:true,reid_mode:'body',compare_window_s:30,retention_hours:24,match_threshold:0.35,
- store_images:true,upload_events:true,upload_vectors:true,upload_images:true,capture_poll_s:0.75,reference_frame_s:10};
+ store_images:true,upload_events:true,upload_vectors:true,upload_images:true,capture_poll_s:0.75,reference_frame_s:10,
+ log_crossings:true};
 function collectParams(){const p={};for(const k of PARAMS){const el=document.getElementById(k);if(!el)continue;
  if(BOOLS.includes(k))p[k]=el.checked; else if(NUMS.includes(k))p[k]=el.value===''?null:Number(el.value); else p[k]=el.value;}return p;}
 function fillParams(p){if(!p)return;for(const k of PARAMS){const el=document.getElementById(k);if(!el||!(k in p))continue;
@@ -987,7 +1028,9 @@ async function loadCfg(){
   rebuild();
   for(const id in doc.geometry){const g=doc.geometry[id]; if(cams[id]){
    cams[id].rot=((g.rotate||0)%360+360)%360;
-   cams[id].line=(g.tripwire||[]).slice(); cams[id].zone=(g.zone||[]).slice(); render(id);}}
+   const tw=g.tripwire||[]; const ls=(tw.length&&typeof tw[0][0]==='number')?[tw]:tw;
+   cams[id].lines=ls.map(s=>s.map(p=>p.slice())); cams[id].pend=[];
+   cams[id].zone=(g.zone||[]).slice(); render(id);}}
  }
  msg.textContent='loaded current config ✓';
 }
@@ -996,7 +1039,7 @@ async function save(){
  const geometry={};
  for(const id in cams){const st=cams[id];
   geometry[id]={rotate:st.rot};
-  if(st.line.length===2)geometry[id].tripwire=st.line;
+  if(st.lines.length)geometry[id].tripwire=st.lines;
   if(st.zone.length>=3)geometry[id].zone=st.zone;}
  const doc={params:collectParams(),geometry:geometry};
  let r; try{r=await fetch('/api/config/'+device,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(doc)});}

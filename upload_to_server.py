@@ -46,15 +46,19 @@ def upload_events(base, device, tok, place=""):
     state = Path("data/.upload_state")
     last = int(state.read_text()) if state.exists() else 0
     con = sqlite3.connect("data/counts.sqlite")
-    rows = con.execute(
-        "SELECT rowid, ts, cam, type, track, dwell FROM events WHERE rowid > ? ORDER BY rowid",
-        (last,),
-    ).fetchall()
+    try:
+        rows = con.execute(
+            "SELECT rowid, ts, cam, type, track, dwell, direction, seg, object FROM events "
+            "WHERE rowid > ? ORDER BY rowid", (last,)).fetchall()
+    except sqlite3.OperationalError:          # new cols not migrated yet — pad defaults
+        rows = [(*r, "", -1, "") for r in con.execute(
+            "SELECT rowid, ts, cam, type, track, dwell FROM events WHERE rowid > ? ORDER BY rowid",
+            (last,)).fetchall()]
     con.close()
     if not rows:
         return "events: 0"
-    events = [{"ts": r[1], "cam": r[2], "type": r[3], "track": r[4], "dwell": r[5], "place": place}
-              for r in rows]
+    events = [{"ts": r[1], "cam": r[2], "type": r[3], "track": r[4], "dwell": r[5], "place": place,
+               "direction": r[6], "seg": r[7], "object": r[8]} for r in rows]
     res = _post(base + "/api/events", {"device": device, "events": events}, tok)
     state.write_text(str(rows[-1][0]))
     return f"events: {res.get('inserted')}"

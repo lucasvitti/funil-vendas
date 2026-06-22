@@ -21,9 +21,28 @@ def load_geometry(path: str | Path) -> dict:
     return data.get("geometry", {}) or {}
 
 
+def parse_tripwires(geom) -> list:
+    """Return a list of (A, B) tripwire segments. Accepts the new multi-segment
+    form ``[[[x,y],[x,y]], ...]`` and the legacy single form ``[[x,y],[x,y]]``."""
+    tw = geom.get("tripwire") or []
+    if not tw:
+        return []
+    if isinstance(tw[0][0], (int, float)):          # legacy single segment
+        return [(tuple(tw[0]), tuple(tw[1]))] if len(tw) >= 2 else []
+    return [(tuple(s[0]), tuple(s[1])) for s in tw if len(s) >= 2]
+
+
 def side_of_line(a, b, p) -> float:
     """Cross product (b-a) x (p-a). >0 one side, <0 the other, 0 on the line."""
     return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+
+
+def centroid(poly):
+    """Average of polygon vertices, or None. Used to define 'inward' = toward the zone."""
+    if not poly:
+        return None
+    n = len(poly)
+    return (sum(p[0] for p in poly) / n, sum(p[1] for p in poly) / n)
 
 
 def point_in_polygon(poly, p) -> bool:

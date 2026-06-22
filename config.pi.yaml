@@ -33,7 +33,8 @@ output:
 detection:
   backend: hailo
   confidence: 0.4
-  classes: [0]           # 0 = person (COCO)
+  detect: person         # what to detect: names or COCO ids — e.g. "person, cat, dog" (takes precedence over classes)
+  classes: [0]           # 0 = person (COCO) — fallback if `detect` is unset
   hailo:
     hef: /usr/share/hailo-models/yolov8s_h8l.hef   # verify path: ls /usr/share/hailo-models/
 
@@ -41,6 +42,8 @@ counting:
   geometry_file: geometry.yaml   # per-camera tripwire line + dwell zone
   dwell_seconds: 1.8             # time in zone to count as a "stop"
   track_cooldown_s: 1.5          # min gap before the same track re-counts a crossing
+  cross_mode: inward             # inward = count only entries (toward the zone) | any = count both directions
+  log_crossings: true            # also log every tripwire crossing as a "cross" event (direction in/out)
   directional: true
   boundary_dedup: true
 
