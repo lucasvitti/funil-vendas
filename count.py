@@ -93,6 +93,18 @@ def draw(image, geom, tracked, counter, privacy, place=""):
     if place:
         cv2.putText(img, place, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(img, place, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 1, cv2.LINE_AA)
+    cam_id = getattr(counter, "cam_id", "")
+    if cam_id:  # top-right corner so it never crowds the left HUD — identifies the source camera
+        (tw, _t), _b = cv2.getTextSize(cam_id, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        cx = max(10, img.shape[1] - tw - 12)
+        cv2.putText(img, cam_id, (cx, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(img, cam_id, (cx, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 1, cv2.LINE_AA)
+    # capture timestamp, top-right under the camera label (yyyy-mm-dd HH:MM:SS)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    (tw2, _t2), _b2 = cv2.getTextSize(ts, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    tx = max(10, img.shape[1] - tw2 - 12)
+    cv2.putText(img, ts, (tx, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(img, ts, (tx, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
     return img
 
 
@@ -151,7 +163,10 @@ def main(config_path: str | None = None) -> int:
         print(f"location: {place}")
 
     detector = build_detector(cfg.get("detection", {}))
-    cameras = [build_camera(c) for c in cfg["cameras"]]
+    cap = cfg.get("capture", {})   # global exposure/gain default, per-camera entry can override
+    cameras = [build_camera({**c, "exposure_us": c.get("exposure_us", cap.get("exposure_us", 0)),
+                             "gain": c.get("gain", cap.get("gain", 0))})
+               for c in cfg["cameras"]]
     for cam in cameras:
         cam.open()
     trackers = {c.cam_id: sv.ByteTrack() for c in cameras}
@@ -200,6 +215,11 @@ def main(config_path: str | None = None) -> int:
     cap_check_s = float(scfg.get("capture_poll_s", 0.75))
     last_ref: dict[str, float] = {}
     last_cap_check = 0.0
+    # operator can request a board restart from the hosted editor/dashboard; we poll
+    # the watermark every ~5s and exit (systemd relaunches us -> re-pull config/geometry).
+    restart_baseline = (server_config.check_restart(srv_base, srv_device, srv_token)
+                        if scfg.get("enabled") else 0.0)
+    last_restart_check = 0.0
     if write_frames:
         frames_dir.mkdir(parents=True, exist_ok=True)
         print(f"reference frames: every {ref_interval:.0f}s (raw) -> {frames_dir}")
@@ -224,6 +244,12 @@ def main(config_path: str | None = None) -> int:
             if write_frames and now - last_cap_check > cap_check_s:
                 last_cap_check = now
                 capture_now = server_config.check_capture(srv_base, srv_device, srv_token)
+            if scfg.get("enabled") and now - last_restart_check > 5.0:
+                last_restart_check = now
+                if server_config.check_restart(srv_base, srv_device, srv_token) > restart_baseline:
+                    print("restart requested from server — exiting for systemd relaunch", flush=True)
+                    db.commit()
+                    sys.exit(0)
             for cam in cameras:
                 frame = cam.read()
                 if frame is None:

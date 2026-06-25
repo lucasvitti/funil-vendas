@@ -32,6 +32,8 @@ def build_camera(cfg: dict) -> CameraSource:
             height=cfg.get("height", 864),
             fps=cfg.get("fps", 30),
             rotate=cfg.get("rotate", 0),
+            exposure_us=cfg.get("exposure_us", 0),
+            gain=cfg.get("gain", 0),
         )
 
     # ai_camera (IMX500) would land here as its own subclass if ever needed.

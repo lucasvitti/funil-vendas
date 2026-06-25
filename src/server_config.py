@@ -51,6 +51,22 @@ def check_capture(base, device, token=None, timeout=8):
         return False
 
 
+def check_restart(base, device, token=None, timeout=8):
+    """Return the server's restart watermark (epoch float) for this device, or 0.0.
+    The board records this at startup and, when a later poll returns a newer value,
+    exits so systemd relaunches it — a clean way to re-pull config + geometry."""
+    token = token or _token()
+    if not base or not token:
+        return 0.0
+    url = f"{base.rstrip('/')}/api/restart/{device}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return float(json.load(resp).get("at") or 0)
+    except Exception:
+        return 0.0
+
+
 def post_frame(base, device, cam, jpg_bytes, token=None, timeout=15):
     """Upload one reference frame immediately (used for on-demand 'take shot')."""
     token = token or _token()
@@ -90,6 +106,8 @@ _PARAM_MAP = {
     "upload_images": ("server", "upload_images"),
     "capture_poll_s": ("server", "capture_poll_s"),
     "reference_frame_s": ("server", "reference_frame_s"),
+    "exposure_us": ("capture", "exposure_us"),
+    "gain": ("capture", "gain"),
 }
 
 

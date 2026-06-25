@@ -19,22 +19,37 @@ _ROTATIONS = {
 
 
 class Picamera2Camera(CameraSource):
-    def __init__(self, cam_id, source=0, width=1536, height=864, fps=30, rotate=0) -> None:
+    def __init__(self, cam_id, source=0, width=1536, height=864, fps=30, rotate=0,
+                 exposure_us=0, gain=0.0) -> None:
         super().__init__(cam_id)
         self.index = int(source)
         self.width = width
         self.height = height
         self.fps = fps
         self.rotate = int(rotate) % 360
+        self.exposure_us = int(exposure_us or 0)   # 0 = auto-exposure
+        self.gain = float(gain or 0.0)
         self._cam = None
 
     def open(self) -> None:
         from picamera2 import Picamera2
 
         cam = Picamera2(self.index)
+        controls = {"FrameRate": float(self.fps)}
+        if self.exposure_us > 0:
+            # Manual exposure: pin a SHORT shutter to freeze walking people, and set
+            # gain to re-brighten. Auto-exposure indoors picks a long (blurry) shutter,
+            # so we disable it (AeEnable=False) to hold ours. Lighting here is constant,
+            # so fixed exposure/gain is stable. Higher gain = brighter but grainier.
+            # NOTE: manual exposure does not adapt to lighting changes; set 0 for auto.
+            controls.update({
+                "AeEnable": False,
+                "ExposureTime": self.exposure_us,
+                "AnalogueGain": self.gain if self.gain > 0 else 4.0,
+            })
         cfg = cam.create_video_configuration(
             main={"size": (self.width, self.height), "format": "RGB888"},
-            controls={"FrameRate": float(self.fps)},
+            controls=controls,
         )
         cam.configure(cfg)
         cam.start()

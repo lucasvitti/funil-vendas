@@ -8,6 +8,7 @@ Auth: every /api/* call needs  Authorization: Bearer <COUNTER_TOKEN>.
 """
 from __future__ import annotations
 
+import array
 import base64
 import csv
 import hashlib
@@ -24,7 +25,8 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 DB = os.environ.get("COUNTER_DB", "/data/counter.sqlite")
-TOKEN = os.environ.get("COUNTER_TOKEN", "")
+TOKEN = os.environ.get("COUNTER_TOKEN", "")              # admin token: full read/write + UI/downloads
+INGEST = os.environ.get("COUNTER_INGEST_TOKEN", "")      # device token: upload + config-pull only (no reads)
 SNAP_DIR = Path(os.environ.get("COUNTER_SNAP_DIR", "/data/snapshots"))
 RETAIN_DAYS = int(os.environ.get("COUNTER_RETAIN_DAYS", "30"))
 USER = os.environ.get("COUNTER_USER", "admin")
@@ -34,6 +36,7 @@ app = FastAPI(title="topofunil counter-api")
 
 # devices with a pending on-demand "take shot" request from the editor
 _CAPTURE_PENDING: set[str] = set()
+_RESTART_AT: dict[str, float] = {}     # device -> last restart-request time; board polls + self-restarts
 _LAST_SEEN: dict[str, float] = {}   # device -> server epoch of last board contact (heartbeat)
 
 
@@ -61,7 +64,16 @@ def _img_date(f):
     return time.strftime("%Y-%m-%d", time.localtime(f.stat().st_mtime))
 
 
-def _images_per_bucket(device, gran, d_from, d_to):
+def _img_time(f):
+    """Time-of-day 'HH:MM' for a snapshot: from its _HHMMSS_ filename part, else mtime.
+    Zero-padded so plain string comparison gives a correct time-of-day range filter."""
+    n = f.name
+    if len(n) >= 13 and n[:8].isdigit() and n[9:13].isdigit():
+        return f"{n[9:11]}:{n[11:13]}"
+    return time.strftime("%H:%M", time.localtime(f.stat().st_mtime))
+
+
+def _images_per_bucket(device, gran, d_from, d_to, cam=None):
     """Count snapshot files (excluding _ref_) per time bucket, keyed like the SQL
     buckets ('YYYY-MM-DD HH:MM') via the filename timestamp (mtime fallback)."""
     out = {}
@@ -71,6 +83,8 @@ def _images_per_bucket(device, gran, d_from, d_to):
     for f in d.glob("*.jpg"):
         n = f.name
         if n.startswith("_"):
+            continue
+        if cam and f"_{cam}_" not in n:
             continue
         if len(n) >= 15 and n[:8].isdigit() and n[9:15].isdigit():
             date = f"{n[0:4]}-{n[4:6]}-{n[6:8]}"; hh, mm = n[9:11], int(n[11:13])
@@ -111,6 +125,31 @@ def _auth(authorization: str | None):
     # constant-time compare so a wrong token can't be guessed by response timing
     if not TOKEN or not authorization or not hmac.compare_digest(authorization, f"Bearer {TOKEN}"):
         raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _is_admin_bearer(authorization):
+    return bool(TOKEN and authorization and hmac.compare_digest(authorization, f"Bearer {TOKEN}"))
+
+
+def _is_ingest_bearer(authorization):
+    return bool(INGEST and authorization and hmac.compare_digest(authorization, f"Bearer {INGEST}"))
+
+
+def _auth_ingest(authorization):
+    """Board-facing endpoints (upload + poll + config-pull): accept the restricted
+    device/ingest token OR the admin token (a superset). Never a cookie — machine calls.
+    The ingest token deliberately does NOT satisfy _auth_ui, so the board cannot read
+    back events / vectors / images — only push them and pull its config."""
+    if _is_ingest_bearer(authorization) or _is_admin_bearer(authorization):
+        return
+    raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _auth_config(request, authorization=None, token_q=None):
+    """Config READ: the board pulls it (ingest token); the editor loads it (cookie/admin)."""
+    if _is_ingest_bearer(authorization):
+        return
+    _auth_ui(request, authorization, token_q)
 
 
 def _auth_dl(authorization, token_q):
@@ -177,7 +216,7 @@ def health():
 
 @app.post("/api/events")
 async def post_events(request: Request, authorization: str = Header(None)):
-    _auth(authorization)
+    _auth_ingest(authorization)
     payload = await request.json()
     device = payload.get("device", "unknown")
     _seen(device)
@@ -206,7 +245,7 @@ def _bucket_sql(gran):
             f"printf('%02d', (CAST(strftime('%M', ts) AS INTEGER)/{gran})*{gran})")
 
 
-def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None, obj=None):
+def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None, obj=None, cam=None):
     """Aggregate conversion straight from the event rows, filtered by date range
     (and place) and bucketed to `gran` minutes. Date is part of each bucket."""
     gran = gran if gran in _GRAN_MIN else 60
@@ -215,6 +254,8 @@ def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None, obj=N
         where.append("device = ?"); args.append(device)
     if place:
         where.append("place = ?"); args.append(place)
+    if cam:
+        where.append("cam = ?"); args.append(cam)
     if d_from:
         where.append("date(ts) >= ?"); args.append(d_from)
     if d_to:
@@ -236,19 +277,19 @@ def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None, obj=N
     brows = con.execute(
         f"SELECT {b} AS bkt, SUM(type='pass'), SUM(type='stop'), "
         f"AVG(CASE WHEN type='stop' THEN dwell END), GROUP_CONCAT(DISTINCT NULLIF(place,'')), "
-        f"GROUP_CONCAT(DISTINCT NULLIF(object,'')) "
+        f"GROUP_CONCAT(DISTINCT NULLIF(object,'')), GROUP_CONCAT(DISTINCT NULLIF(cam,'')) "
         f"FROM events{ev_wsql} GROUP BY bkt ORDER BY bkt", ev_args).fetchall()
     # vectors saved per bucket — same WHERE works (vectors has device/place/ts too)
     vrows = con.execute(
         f"SELECT {b} AS bkt, COUNT(*) FROM vectors{wsql} GROUP BY bkt", args).fetchall()
     con.close()
     vecmap = {r[0]: r[1] for r in vrows}
-    imgmap = _images_per_bucket(device, gran, d_from, d_to)  # snapshot files by filename ts
+    imgmap = _images_per_bucket(device, gran, d_from, d_to, cam)  # snapshot files by filename ts
     rows = []
-    for bkt, p, s, dav, pl, obn in brows:
+    for bkt, p, s, dav, pl, obn, cmn in brows:
         p, s = p or 0, s or 0
         rows.append({"date": (bkt or "")[:10], "time": (bkt or "")[11:16],
-                     "place": pl or "", "object": obn or "", "passers": p, "stops": s,
+                     "place": pl or "", "object": obn or "", "cam": cmn or "", "passers": p, "stops": s,
                      "conversion_pct": round(s / p * 100, 1) if p else 0.0,
                      "dwell_avg": round(dav, 1) if dav is not None else None,
                      "images": imgmap.get(bkt, 0), "vectors": vecmap.get(bkt, 0)})
@@ -261,7 +302,7 @@ def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None, obj=N
         overall["dwell_s"] = {"avg": round(tot[2], 1), "max": round(tot[3], 1)}
     return {
         "device": device or "all",
-        "filter": {"from": d_from or None, "to": d_to or None, "gran": gran, "place": place or None, "object": obj or None},
+        "filter": {"from": d_from or None, "to": d_to or None, "gran": gran, "place": place or None, "object": obj or None, "cam": cam or None},
         "period": {"from": tot[5], "to": tot[6]} if n else None,
         "events": n,
         "vectors": total_vectors,
@@ -272,16 +313,17 @@ def _report_data(device=None, d_from=None, d_to=None, gran=60, place=None, obj=N
 
 
 @app.get("/api/report")
-def report(device: str = None, authorization: str = Header(None),
+def report(request: Request, device: str = None, authorization: str = Header(None),
            from_: str = Query(None, alias="from"), to: str = Query(None),
-           gran: int = Query(60), place: str = Query(None), obj: str = Query(None, alias="object")):
-    _auth(authorization)
-    return _report_data(device, from_, to, gran, place, obj)
+           gran: int = Query(60), place: str = Query(None), obj: str = Query(None, alias="object"),
+           cam: str = Query(None), token: str = Query(None)):
+    _auth_ui(request, authorization, token)          # report is a data read -> admin/cookie only
+    return _report_data(device, from_, to, gran, place, obj, cam)
 
 
 @app.get("/api/config/{device}")
 def get_config(device: str, request: Request, authorization: str = Header(None), token: str = Query(None)):
-    _auth_ui(request, authorization, token)
+    _auth_config(request, authorization, token)
     con = _db()
     row = con.execute("SELECT body FROM configs WHERE device = ?", (device,)).fetchone()
     con.close()
@@ -309,7 +351,7 @@ async def put_config(device: str, request: Request, authorization: str = Header(
 async def post_frame(request: Request, authorization: str = Header(None)):
     # board uploads a clean, face-pixelated reference frame per camera so the
     # hosted geometry editor has an up-to-date background to draw on.
-    _auth(authorization)
+    _auth_ingest(authorization)
     p = await request.json()
     device = p.get("device", "unknown")
     _seen(device)
@@ -346,11 +388,28 @@ def request_capture(device: str, request: Request, authorization: str = Header(N
 @app.get("/api/capture/{device}")
 def poll_capture(device: str, authorization: str = Header(None)):
     # board polls + consumes the flag (also our liveness heartbeat)
-    _auth(authorization)
+    _auth_ingest(authorization)
     _seen(device)
     pending = device in _CAPTURE_PENDING
     _CAPTURE_PENDING.discard(device)
     return {"pending": pending}
+
+
+@app.post("/api/restart/{device}")
+def request_restart(device: str, request: Request, authorization: str = Header(None), token: str = Query(None)):
+    # editor/dashboard asks the board to restart so it re-pulls config + geometry
+    _auth_ui(request, authorization, token)
+    _RESTART_AT[device] = time.time()
+    return {"requested": device, "at": _RESTART_AT[device]}
+
+
+@app.get("/api/restart/{device}")
+def poll_restart(device: str, authorization: str = Header(None)):
+    # board polls this watermark; if it's newer than the board's startup baseline,
+    # the board exits and systemd relaunches it (clean re-pull). Also a heartbeat.
+    _auth_ingest(authorization)
+    _seen(device)
+    return {"at": _RESTART_AT.get(device, 0)}
 
 
 @app.get("/api/frame_status/{device}")
@@ -368,7 +427,7 @@ def frame_status(device: str, request: Request, authorization: str = Header(None
 
 @app.post("/api/vectors")
 async def post_vectors(request: Request, authorization: str = Header(None)):
-    _auth(authorization)
+    _auth_ingest(authorization)
     payload = await request.json()
     device = payload.get("device", "unknown")
     vs = payload.get("vectors", [])
@@ -389,7 +448,7 @@ async def post_vectors(request: Request, authorization: str = Header(None)):
 
 @app.post("/api/snapshots")
 async def post_snapshots(request: Request, authorization: str = Header(None)):
-    _auth(authorization)
+    _auth_ingest(authorization)
     payload = await request.json()
     device = payload.get("device", "unknown")
     name = payload.get("name")
@@ -409,40 +468,87 @@ async def post_snapshots(request: Request, authorization: str = Header(None)):
 
 
 @app.get("/api/events.csv")
-def events_csv(request: Request, device: str = None, authorization: str = Header(None), token: str = Query(None)):
+def events_csv(request: Request, device: str = None,
+               from_: str = Query(None, alias="from"), to: str = Query(None),
+               place: str = Query(None), obj: str = Query(None, alias="object"),
+               cam: str = Query(None),
+               authorization: str = Header(None), token: str = Query(None)):
+    # honors the dashboard's active filters (range / place / object / camera) so the
+    # download matches what's on screen.
     _auth_ui(request, authorization, token)
-    con = _db()
-    q = "SELECT device, place, object, ts, cam, type, track, dwell, direction, seg FROM events"
-    args = []
+    where, args = [], []
     if device:
-        q += " WHERE device = ?"
-        args = [device]
-    rows = con.execute(q + " ORDER BY ts", args).fetchall()
+        where.append("device = ?"); args.append(device)
+    if place:
+        where.append("place = ?"); args.append(place)
+    if obj:
+        where.append("object = ?"); args.append(obj)
+    if cam:
+        where.append("cam = ?"); args.append(cam)
+    if from_:
+        where.append("date(ts) >= ?"); args.append(from_)
+    if to:
+        where.append("date(ts) <= ?"); args.append(to)
+    wsql = (" WHERE " + " AND ".join(where)) if where else ""
+    con = _db()
+    rows = con.execute(
+        "SELECT device, place, object, ts, cam, type, track, dwell, direction, seg FROM events"
+        + wsql + " ORDER BY ts", args).fetchall()
     con.close()
     return _csv(rows, ["device", "place", "object", "ts", "cam", "type", "track", "dwell", "direction", "seg"],
                 "events.csv")
 
 
 @app.get("/api/vectors.csv")
-def vectors_csv(request: Request, device: str = None, authorization: str = Header(None), token: str = Query(None)):
+def vectors_csv(request: Request, device: str = None,
+                from_: str = Query(None, alias="from"), to: str = Query(None),
+                place: str = Query(None), cam: str = Query(None),
+                fmt: str = Query("b64", alias="format"),
+                authorization: str = Header(None), token: str = Query(None)):
+    # vectors carry device/place/cam/ts (but no object column) — honor those filters.
+    # format=numeric expands the float32 BLOB into v0..vN columns; default = base64 blob.
     _auth_ui(request, authorization, token)
-    con = _db()
-    q = ("SELECT device, place, ts, cam, track, event, mode, clarity, face_visible, "
-         "body_visible, image, match_track, match_dist, vec FROM vectors")
-    args = []
+    where, args = [], []
     if device:
-        q += " WHERE device = ?"
-        args = [device]
-    rows = con.execute(q + " ORDER BY ts", args).fetchall()
+        where.append("device = ?"); args.append(device)
+    if place:
+        where.append("place = ?"); args.append(place)
+    if cam:
+        where.append("cam = ?"); args.append(cam)
+    if from_:
+        where.append("date(ts) >= ?"); args.append(from_)
+    if to:
+        where.append("date(ts) <= ?"); args.append(to)
+    wsql = (" WHERE " + " AND ".join(where)) if where else ""
+    con = _db()
+    rows = con.execute(
+        "SELECT device, place, ts, cam, track, event, mode, clarity, face_visible, "
+        "body_visible, image, match_track, match_dist, vec FROM vectors" + wsql + " ORDER BY ts", args).fetchall()
     con.close()
+    base_cols = ["device", "place", "ts", "cam", "track", "event", "mode", "clarity",
+                 "face_visible", "body_visible", "image", "match_track", "match_dist"]
+    if (fmt or "").lower() in ("numeric", "num", "expanded", "values"):
+        # expand the float32 BLOB into v0..v{n-1} numeric columns (stdlib array, no numpy).
+        # vdim derived from the data so it tracks the actual vector length (512 today).
+        vdim = next((len(r[-1]) // 4 for r in rows if r[-1]), 512)
+        header = base_cols + [f"v{i}" for i in range(vdim)]
+        out = []
+        for r in rows:
+            blob = r[-1]
+            if not blob:
+                vals = [""] * vdim
+            else:
+                a = array.array("f")
+                a.frombytes(blob[:vdim * 4])               # little-endian float32 (native on x86/ARM)
+                vals = list(a) + [""] * (vdim - len(a))
+            out.append(list(r[:-1]) + vals)
+        return _csv(out, header, "vectors_numeric.csv")
     out = []
     for r in rows:
         r = list(r)
         r[-1] = base64.b64encode(r[-1]).decode() if r[-1] is not None else ""
         out.append(r)
-    header = ["device", "place", "ts", "cam", "track", "event", "mode", "clarity",
-              "face_visible", "body_visible", "image", "match_track", "match_dist", "vec_b64"]
-    return _csv(out, header, "vectors.csv")
+    return _csv(out, base_cols + ["vec_b64"], "vectors.csv")
 
 
 @app.post("/api/purge")
@@ -576,18 +682,85 @@ def _freshness_html(device):
     return live, (last_ev or "&mdash;")
 
 
-def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None, obj=None):
-    rep = _report_data(device, d_from, d_to, gran, place, obj)
+def _tabbar(active):
+    """Shared top nav: Dashboard / Geometry / Gallery tabs + a fixed logout.
+    `active` is one of 'dashboard'|'geometry'|'gallery' (the highlighted tab).
+    Self-contained (ships its own <style>) so all three pages share one source."""
+    def tab(key, href, label):
+        on = " on" if key == active else ""
+        return f'<a class="tab{on}" href="{href}">{label}</a>'
+    return (
+        "<style>"
+        ".barin .lead{display:flex;align-items:center;gap:20px}"
+        ".tabs{display:flex;gap:4px}"
+        ".tabs .tab{padding:6px 12px;border-radius:6px;color:#555;font-size:14px;text-decoration:none}"
+        ".tabs .tab:hover{background:#eef3f4}"
+        ".tabs .tab.on{background:#0a7;color:#fff}"
+        ".logout{color:#0a7;text-decoration:none;font-size:14px}"
+        "</style>"
+        "<div class=bar><div class=barin>"
+        "<span class=lead>"
+        "<span class=brand><img src='/logo' alt=''><b>topofunil</b></span>"
+        "<nav class=tabs>"
+        + tab("dashboard", "/", "Dashboard")
+        + tab("geometry", "/config", "Geometry")
+        + tab("gallery", "/gallery", "Gallery")
+        + "</nav></span>"
+        "<a class=logout href='/logout'>logout</a>"
+        "</div></div>"
+    )
+
+
+_DASH_SORT_JS = """
+(function(){
+ const tb=document.getElementById('tb');
+ const ths=Array.prototype.slice.call(document.querySelectorAll('thead th'));
+ if(!tb||!ths.length)return;
+ ths.forEach(function(th){th.dataset.label=th.textContent;th.style.cursor='pointer';th.style.userSelect='none';});
+ const NUM=new Set([5,6,7,8,9]);          // passers/stops/conversion/images/vectors sort numerically
+ let sc=0,sd='desc';                       // default: date+time, newest first
+ function cv(tr,i){
+  if(i===0)return tr.children[0].textContent.trim()+' '+(tr.children[1]?tr.children[1].textContent.trim():'');
+  const t=(tr.children[i]?tr.children[i].textContent:'').trim();
+  return NUM.has(i)?(parseFloat(t.replace('%',''))||0):t;
+ }
+ function drows(){return Array.prototype.slice.call(tb.querySelectorAll('tr')).filter(function(r){return r.children.length>1;});}
+ function apply(){
+  const rows=drows();
+  if(rows.length){
+   rows.sort(function(a,b){const av=cv(a,sc),bv=cv(b,sc);const c=av<bv?-1:(av>bv?1:0);return sd==='asc'?c:-c;});
+   rows.forEach(function(r){tb.appendChild(r);});
+  }
+  ths.forEach(function(th,i){th.textContent=th.dataset.label+(i===sc?(sd==='asc'?' \\u25B2':' \\u25BC'):'');});
+  pgi=0;pgRender();
+ }
+ ths.forEach(function(th,i){th.addEventListener('click',function(){
+  if(i===sc)sd=(sd==='asc'?'desc':'asc');else{sc=i;sd=NUM.has(i)?'desc':'asc';}
+  apply();
+ });});
+ apply();
+})();
+"""
+
+
+def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None, obj=None, cam=None):
+    if d_from is None and d_to is None:
+        # fresh load with no date params -> default the filter to the current
+        # (latest-data) day; the user can clear it for all-time or widen the range.
+        con = _db()
+        d_from = con.execute("SELECT MAX(date(ts)) FROM events WHERE device=?", (device,)).fetchone()[0]
+        con.close()
+    rep = _report_data(device, d_from, d_to, gran, place, obj, cam)
     o = rep["overall"]
     fl = rep["filter"]
     body = ""
-    for a in rep.get("rows", []):
+    for a in reversed(rep.get("rows", [])):   # newest bucket first (JS can re-sort)
         body += (f"<tr><td>{a['date']}</td><td>{a['time']}</td><td>{_esc(a.get('place') or '—')}</td>"
-                 f"<td>{_esc(a.get('object') or '—')}</td>"
+                 f"<td>{_esc(a.get('object') or '—')}</td><td>{_esc(a.get('cam') or '—')}</td>"
                  f"<td>{a['passers']}</td><td>{a['stops']}</td><td>{a['conversion_pct']}%</td>"
                  f"<td>{a['images']}</td><td>{a['vectors']}</td></tr>")
     if not body:
-        body = "<tr><td colspan=9 style='text-align:center;color:#999'>no events in this range</td></tr>"
+        body = "<tr><td colspan=10 style='text-align:center;color:#999'>no events in this range</td></tr>"
     p = rep.get("period")
     per = f"{p['from']} &rarr; {p['to']}" if p else "&mdash;"
     nb = len(rep.get("rows", []))
@@ -611,9 +784,18 @@ def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None, obj=Non
     osel = "<option value=''>all objects</option>" + "".join(
         f'<option value="{_esc(o2)}"{" selected" if o2 == cur_obj else ""}>{_esc(o2)}</option>'
         for o2 in objs)
+    con = _db()
+    cams = [r[0] for r in con.execute(
+        "SELECT DISTINCT cam FROM events WHERE device=? AND cam IS NOT NULL AND cam!='' "
+        "ORDER BY cam", (device,))]
+    con.close()
+    cur_cam = fl.get("cam") or ""
+    csel = "<option value=''>all cameras</option>" + "".join(
+        f'<option value="{_esc(c3)}"{" selected" if c3 == cur_cam else ""}>{_esc(c3)}</option>'
+        for c3 in cams)
     vf, vt = fl["from"] or "", fl["to"] or ""
     live, latest = _freshness_html(device)
-    qs = f"device={device}&amp;from={vf}&amp;to={vt}&amp;gran={fl['gran']}&amp;place={_esc(cur_place)}&amp;object={_esc(cur_obj)}"
+    qs = f"device={device}&amp;from={vf}&amp;to={vt}&amp;gran={fl['gran']}&amp;place={_esc(cur_place)}&amp;object={_esc(cur_obj)}&amp;cam={_esc(cur_cam)}"
     return f"""<!doctype html><meta charset=utf-8><title>topofunil</title>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <style>
@@ -633,32 +815,30 @@ def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None, obj=Non
  form.flt button{{padding:7px 14px;background:#0a7;color:#fff;border:0;border-radius:5px;cursor:pointer;font-size:14px}}
  table{{border-collapse:collapse;margin-top:10px;width:100%;font-size:14px}}
  td,th{{border:1px solid #ddd;padding:5px 9px;text-align:right}} th{{background:#f4f4f4}}
- td:first-child,th:first-child,td:nth-child(2),th:nth-child(2),td:nth-child(3),th:nth-child(3),td:nth-child(4),th:nth-child(4){{text-align:left}}
+ td:first-child,th:first-child,td:nth-child(2),th:nth-child(2),td:nth-child(3),th:nth-child(3),td:nth-child(4),th:nth-child(4),td:nth-child(5),th:nth-child(5){{text-align:left}}
  a.btn{{display:inline-block;margin:4px 8px 4px 0;padding:9px 13px;background:#0a7;color:#fff;
   text-decoration:none;border-radius:5px;font-size:14px}}
  .purge{{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:6px;padding:10px 12px;
   background:#fff7f7;border:1px solid #f1d4d4;border-radius:8px;font-size:13px}}
  .purge label{{display:flex;align-items:center;gap:5px}}
- .purge input[type=date]{{padding:5px;border:1px solid #ccd1d4;border-radius:5px}}
+ .purge input[type=text]{{padding:5px;border:1px solid #ccd1d4;border-radius:5px}}
  button.danger{{padding:7px 14px;background:#c0392b;color:#fff;border:0;border-radius:5px;cursor:pointer;font-size:14px}}
  #pmsg{{font-size:13px;color:#c0392b}}
  #pgnav{{display:none;gap:10px;align-items:center;margin:8px 0;font-size:14px}}
  #pgnav button{{padding:5px 11px;border:1px solid #ccd1d4;border-radius:5px;background:#fff;cursor:pointer}}
  #pgind{{color:#555}}
 </style>
-<div class=bar><div class=barin>
- <span class=brand><img src="/logo" alt=""><b>topofunil</b> &middot; {device}</span>
- <span><a href="/config?device={device}">geometry &amp; config</a> &nbsp;&middot;&nbsp; <a href=/logout>logout</a></span>
-</div></div>
+{_tabbar('dashboard')}
 <main>
-<div class=fresh>{live} &middot; latest event: {latest} &middot; <a href="?{qs}">&#8635; refresh</a></div>
+<div class=fresh>{live} &middot; latest event: {latest} &middot; <a href="?{qs}">&#8635; refresh</a> &middot; <a href="#" onclick="restartBoard();return false">&#8635; restart board</a></div>
 <form class=flt method=get>
  <input type=hidden name=device value="{device}">
- <label>from<input type=date name=from value="{vf}"></label>
- <label>to<input type=date name=to value="{vt}"></label>
+ <label>from<input type=text size=12 placeholder=yyyy-mm-dd pattern="\\d{{4}}-\\d{{2}}-\\d{{2}}" title="yyyy-mm-dd" name=from value="{vf}"></label>
+ <label>to<input type=text size=12 placeholder=yyyy-mm-dd pattern="\\d{{4}}-\\d{{2}}-\\d{{2}}" title="yyyy-mm-dd" name=to value="{vt}"></label>
  <label>granularity<select name=gran>{gsel}</select></label>
  <label>place<select name=place>{psel}</select></label>
  <label>object<select name=object>{osel}</select></label>
+ <label>camera<select name=cam>{csel}</select></label>
  <button type=submit>Apply</button>
 </form>
 <p style=color:#888;font-size:13px>range: {per} &middot; {rep['events']} events &middot; {rep['vectors']} vectors &middot; {rep['images']} images &middot; {nb} buckets</p>
@@ -668,17 +848,18 @@ def _dashboard_html(device, d_from=None, d_to=None, gran=60, place=None, obj=Non
  <span class=k>conversion<b>{o['conversion_pct']}%</b></span>
 </div>
 <h3>Downloads</h3>
-<a class=btn href="/api/events.csv?device={device}">Report CSV</a>
-<a class=btn href="/api/vectors.csv?device={device}">Vectors CSV</a>
-<a class=btn href="/api/snapshots.zip?device={device}">Images ZIP</a>
-<h3>Conversion by {fl['gran']}-min bucket</h3>
-<table><thead><tr><th>date</th><th>time</th><th>place</th><th>object</th><th>passers</th><th>stops</th><th>conversion</th><th>images</th><th>vectors</th></tr></thead><tbody id=tb>{body}</tbody></table>
+<a class=btn href="/api/events.csv?{qs}">Report CSV</a>
+<a class=btn href="/api/vectors.csv?{qs}">Vectors CSV</a>
+<a class=btn href="/api/vectors.csv?{qs}&amp;format=numeric">Vectors (numeric)</a>
+<a class=btn href="/api/snapshots.zip?{qs}">Images ZIP</a>
+<h3>Conversion by {fl['gran']}-min bucket <span style="font-weight:400;font-size:12px;color:#999">— newest first; click a column to sort</span></h3>
+<table><thead><tr><th>date</th><th>time</th><th>place</th><th>object</th><th>cam</th><th>passers</th><th>stops</th><th>conversion</th><th>images</th><th>vectors</th></tr></thead><tbody id=tb>{body}</tbody></table>
 <div id=pgnav><button onclick=pgPrev()>&lsaquo; prev</button> <span id=pgind></span> <button onclick=pgNext()>next &rsaquo;</button></div>
 <h3>Purge data (LGPD)</h3>
 <p style="color:#888;font-size:12px;margin:2px 0">Permanently delete re-ID vectors and face-pixelated images in a date range (this device). Anonymous counts are kept. Empty dates = all.</p>
 <div class=purge>
- <label>from <input type=date id=pf></label>
- <label>to <input type=date id=pt></label>
+ <label>from <input type=text size=12 placeholder=yyyy-mm-dd pattern="\\d{{4}}-\\d{{2}}-\\d{{2}}" title="yyyy-mm-dd" id=pf></label>
+ <label>to <input type=text size=12 placeholder=yyyy-mm-dd pattern="\\d{{4}}-\\d{{2}}-\\d{{2}}" title="yyyy-mm-dd" id=pt></label>
  <label><input type=checkbox id=pi checked> images</label>
  <label><input type=checkbox id=pv checked> vectors</label>
  <button class=danger onclick=purgeData()>Purge&hellip;</button>
@@ -697,7 +878,12 @@ function pgRender(){{
 }}
 function pgPrev(){{pgi--;pgRender();}}
 function pgNext(){{pgi++;pgRender();}}
-pgRender();
+{_DASH_SORT_JS}
+async function restartBoard(){{
+ if(!confirm('Restart the board now? It will re-pull config + geometry and resume counting in ~10–20s.'))return;
+ const r=await fetch('/api/restart/'+encodeURIComponent(PDEV),{{method:'POST'}});
+ alert(r.ok?'Restart requested — the board will pick it up within ~5s.':'Failed ('+r.status+')');
+}}
 async function purgeData(){{
  const m=document.getElementById('pmsg');
  const b={{device:PDEV,from:document.getElementById('pf').value||'',to:document.getElementById('pt').value||'',
@@ -748,10 +934,11 @@ def logout():
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, device: str = "pi-cam",
               from_: str = Query(None, alias="from"), to: str = Query(None),
-              gran: int = Query(60), place: str = Query(None), obj: str = Query(None, alias="object")):
+              gran: int = Query(60), place: str = Query(None), obj: str = Query(None, alias="object"),
+              cam: str = Query(None)):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(_dashboard_html(device, from_, to, gran, place, obj))
+    return HTMLResponse(_dashboard_html(device, from_, to, gran, place, obj, cam))
 
 
 _EDITOR_HTML = """<!doctype html><meta charset=utf-8><title>topofunil — geometry &amp; config</title>
@@ -790,10 +977,7 @@ _EDITOR_HTML = """<!doctype html><meta charset=utf-8><title>topofunil — geomet
   border-radius:4px;font-size:13px;color:#333;min-height:18px}
  .grid label:hover{background:#f7fbfb;border-radius:4px}
 </style>
-<div class=bar><div class=barin>
- <span class=brand><img src="/logo" alt=""><b>topofunil</b> <span style="color:#888;font-weight:400">geometry &amp; config · <span id=dev></span></span></span>
- <a id=back href=/>← dashboard</a>
-</div></div>
+<!--TABBAR-->
 <main>
 <div class=ctl>cameras: <input id=cams value="cam0,cam1"> <button onclick=rebuild()>rebuild</button>
  <button onclick=loadCfg()>load current</button>
@@ -835,6 +1019,11 @@ _EDITOR_HTML = """<!doctype html><meta charset=utf-8><title>topofunil — geomet
  <label>Upload re-ID vectors <input id=upload_vectors type=checkbox></label>
  <label>Upload snapshots <input id=upload_images type=checkbox></label>
 </div>
+<div class=pcat>Camera image (motion blur)</div>
+<div class=grid>
+ <label>Exposure / shutter µs (0=auto) <input id=exposure_us type=number step=500 min=0></label>
+ <label>Gain / ISO (0=auto) <input id=gain type=number step=0.5 min=0></label>
+</div>
 <div class=pcat>Board capture timing</div>
 <div class=grid>
  <label>Auto-shot interval (s) <input id=reference_frame_s type=number step=0.5 min=0.5></label>
@@ -849,8 +1038,6 @@ Rotation is saved per camera and applied by the board at capture. Geometry coord
 <script>
 const qs=new URLSearchParams(location.search), device=qs.get('device')||'pi-cam';
 const msg=document.getElementById('msg');
-document.getElementById('dev').textContent=device;
-document.getElementById('back').href='/?device='+encodeURIComponent(device);
 let cams={};
 
 function camList(){return document.getElementById('cams').value.split(',').map(s=>s.trim()).filter(Boolean);}
@@ -976,9 +1163,9 @@ function render(id){
  const el=document.getElementById('pts_'+id); if(el)el.textContent=' rot '+rot+'° · tripwires '+st.lines.length+(st.pend.length?' (+1 pending)':'')+' · zone '+st.zone.length+' pts';
 }
 
-const PARAMS=['place_name','dwell_seconds','track_cooldown_s','cross_mode','log_crossings','confidence','detect','face_mode','reid_enabled','reid_mode','compare_window_s','retention_hours','match_threshold','store_images','upload_events','upload_vectors','upload_images','capture_poll_s','reference_frame_s'];
+const PARAMS=['place_name','dwell_seconds','track_cooldown_s','cross_mode','log_crossings','confidence','detect','face_mode','reid_enabled','reid_mode','compare_window_s','retention_hours','match_threshold','store_images','upload_events','upload_vectors','upload_images','capture_poll_s','reference_frame_s','exposure_us','gain'];
 const BOOLS=['reid_enabled','store_images','upload_events','upload_vectors','upload_images','log_crossings'];
-const NUMS=['dwell_seconds','track_cooldown_s','confidence','compare_window_s','retention_hours','match_threshold','capture_poll_s','reference_frame_s'];
+const NUMS=['dwell_seconds','track_cooldown_s','confidence','compare_window_s','retention_hours','match_threshold','capture_poll_s','reference_frame_s','exposure_us','gain'];
 const HINTS={
  place_name:'Where this board is located (store/site name). Logged on every event, vector, and saved image; filterable on the dashboard. Set it before moving the kiosk.',
  dwell_seconds:'Seconds a person must stay inside the zone to count as a "stop" (dwell).',
@@ -998,7 +1185,9 @@ const HINTS={
  upload_vectors:'Upload re-ID vectors to the server (personal data — keep the DPO informed).',
  upload_images:'Upload face-pixelated event snapshots to the server.',
  capture_poll_s:'How often the board checks for a "take shot" request (seconds). Lower = snappier, more idle polling. Applies on next board start.',
- reference_frame_s:'How often the board auto-captures a fresh reference frame (seconds between shots). Lower = more frequent. Applies on next board start.'};
+ reference_frame_s:'How often the board auto-captures a fresh reference frame (seconds between shots). Lower = more frequent. Applies on next board start.',
+ exposure_us:'Fixed shutter time in microseconds to freeze motion (0 = auto-exposure). Lower = sharper moving people but darker. ~8000≈1/125s, ~4000≈1/250s, ~2000≈1/500s. Raise gain to re-brighten. Manual exposure does NOT adapt to lighting changes. Applies on next board start.',
+ gain:'Sensor gain (ISO) used when exposure is fixed (0 → a moderate default ≈4). Higher re-brightens a short exposure but adds grain. Try 4–8 indoors. Ignored when exposure = 0 (auto).'};
 function wireHints(){const h=document.getElementById('hint'); const dflt=h.textContent;
  for(const k in HINTS){const el=document.getElementById(k); if(!el)continue;
   const lab=el.parentElement||el;
@@ -1010,7 +1199,7 @@ function wireHints(){const h=document.getElementById('hint'); const dflt=h.textC
 const DEFAULTS={place_name:'',dwell_seconds:1.8,track_cooldown_s:1.5,cross_mode:'inward',confidence:0.4,detect:'person',face_mode:'pixelate',
  reid_enabled:true,reid_mode:'body',compare_window_s:30,retention_hours:24,match_threshold:0.35,
  store_images:true,upload_events:true,upload_vectors:true,upload_images:true,capture_poll_s:0.75,reference_frame_s:10,
- log_crossings:true};
+ log_crossings:true,exposure_us:0,gain:0};
 function collectParams(){const p={};for(const k of PARAMS){const el=document.getElementById(k);if(!el)continue;
  if(BOOLS.includes(k))p[k]=el.checked; else if(NUMS.includes(k))p[k]=el.value===''?null:Number(el.value); else p[k]=el.value;}return p;}
 function fillParams(p){if(!p)return;for(const k of PARAMS){const el=document.getElementById(k);if(!el||!(k in p))continue;
@@ -1056,21 +1245,140 @@ loadCfg();
 def config_editor(request: Request):
     if not _logged_in(request):
         return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(_EDITOR_HTML)
+    return HTMLResponse(_EDITOR_HTML.replace("<!--TABBAR-->", _tabbar("geometry")))
 
 
 @app.get("/api/snapshots.zip")
-def snapshots_zip(request: Request, device: str = "pi-cam", authorization: str = Header(None), token: str = Query(None)):
+def snapshots_zip(request: Request, device: str = "pi-cam",
+                  from_: str = Query(None, alias="from"), to: str = Query(None),
+                  cam: str = Query(None),
+                  authorization: str = Header(None), token: str = Query(None)):
     _auth_ui(request, authorization, token)
-    d = SNAP_DIR / device
+    d = SNAP_DIR / Path(device).name
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         if d.exists():
             for f in sorted(d.glob("*.jpg")):
                 if f.name.startswith("_"):
                     continue  # skip reference frames (_ref_*.jpg)
+                if cam and f"_{cam}_" not in f.name:
+                    continue  # honor the camera filter
+                fd = _img_date(f)
+                if (from_ and fd < from_) or (to and fd > to):
+                    continue  # honor the dashboard date range
                 z.write(f, f.name)
     return Response(
         buf.getvalue(), media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename={device}_snapshots.zip"},
     )
+
+
+@app.get("/api/snap/{device}/{name}")
+def get_snap(device: str, name: str, request: Request,
+             authorization: str = Header(None), token: str = Query(None)):
+    """Serve one face-pixelated event snapshot for the gallery (cookie/bearer/token)."""
+    _auth_ui(request, authorization, token)
+    safe = Path(name).name                       # strip path components (no traversal)
+    if not safe.lower().endswith(".jpg") or safe.startswith("_"):
+        raise HTTPException(status_code=404, detail="not found")
+    f = SNAP_DIR / Path(device).name / safe
+    if not f.exists():
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(f.read_bytes(), media_type="image/jpeg",
+                    headers={"Cache-Control": "max-age=3600"})
+
+
+def _snap_caption(name):
+    """Human label from a snapshot filename: 'HH:MM:SS · cam0 · pass' / 'dwell 2.1s'."""
+    stem = name[:-4] if name.lower().endswith(".jpg") else name
+    parts = stem.split("_")
+    if len(parts) >= 5 and len(parts[0]) == 8 and parts[0].isdigit() and len(parts[1]) >= 6:
+        t = f"{parts[1][0:2]}:{parts[1][2:4]}:{parts[1][4:6]}"
+        kind = parts[4]
+        if kind == "dwell" and len(parts) >= 6:
+            kind = f"dwell {parts[5]}"
+        return f"{t} · {parts[3]} · {kind}"
+    return name
+
+
+def _gallery_html(device, d_from=None, d_to=None, page=0, t_from=None, t_to=None):
+    dev = Path(device or "pi-cam").name
+    d = SNAP_DIR / dev
+    items = []
+    if d.exists():
+        for f in d.glob("*.jpg"):
+            if not f.name.startswith("_"):
+                items.append((f.name, _img_date(f), _img_time(f)))
+    items.sort(key=lambda it: it[0], reverse=True)        # newest first (filename ts)
+    dates = [fd for _, fd, _t in items]
+    # default range = most recent day with images (robust to board/server clock skew)
+    if not d_from and not d_to and dates:
+        d_from = d_to = max(dates)
+    # time filter is a time-of-day window applied within each day of the date range
+    shown = [it for it in items
+             if not ((d_from and it[1] < d_from) or (d_to and it[1] > d_to)
+                     or (t_from and it[2] < t_from) or (t_to and it[2] > t_to))]
+    total = len(shown)
+    PER = 60
+    pages = max(1, (total + PER - 1) // PER)
+    page = max(0, min(int(page or 0), pages - 1))
+    chunk = shown[page * PER:(page + 1) * PER]
+    cells = ""
+    for n, fd, _t in chunk:
+        url = f"/api/snap/{dev}/{n}"
+        cells += (f"<figure><a href='{url}' target=_blank><img loading=lazy src='{url}' alt=''></a>"
+                  f"<figcaption>{_esc(fd[5:])} {_esc(_snap_caption(n))}</figcaption></figure>")
+    if not cells:
+        cells = "<p style='color:#999'>no images in this range</p>"
+    vf, vt = d_from or "", d_to or ""
+    vtf, vtt = t_from or "", t_to or ""
+    base = f"device={dev}&amp;from={vf}&amp;to={vt}&amp;tfrom={vtf}&amp;tto={vtt}"
+    prev_a = (f"<a class=pg href='?{base}&amp;page={page-1}'>&lsaquo; prev</a>"
+              if page > 0 else "<span class='pg off'>&lsaquo; prev</span>")
+    next_a = (f"<a class=pg href='?{base}&amp;page={page+1}'>next &rsaquo;</a>"
+              if page < pages - 1 else "<span class='pg off'>next &rsaquo;</span>")
+    pager = (f"<div class=pager>{prev_a} <span>page {page+1} / {pages} &middot; {total} images</span> {next_a}</div>"
+             if total else "")
+    return f"""<!doctype html><meta charset=utf-8><title>topofunil — gallery</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+ body{{font-family:system-ui;margin:0;color:#1a1a1a}}
+ .bar{{position:sticky;top:0;z-index:50;background:#fff;border-bottom:1px solid #e5e8ea;box-shadow:0 1px 6px rgba(0,0,0,.04)}}
+ .barin{{max-width:1040px;margin:0 auto;padding:8px 16px;display:flex;justify-content:space-between;align-items:center}}
+ .brand{{display:flex;align-items:center;gap:9px;font-size:16px}} .brand img{{height:28px}}
+ main{{max-width:1040px;margin:0 auto;padding:18px 16px}}
+ form.flt{{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:4px 0 14px;
+  padding:10px 12px;background:#f7f9fa;border:1px solid #e5e8ea;border-radius:8px}}
+ form.flt label{{font-size:12px;color:#555}}
+ form.flt input{{display:block;margin-top:3px;padding:5px;border:1px solid #ccd1d4;border-radius:5px;font-size:14px}}
+ form.flt button{{padding:7px 14px;background:#0a7;color:#fff;border:0;border-radius:5px;cursor:pointer;font-size:14px}}
+ .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px}}
+ figure{{margin:0}} figure img{{width:100%;height:128px;object-fit:cover;border-radius:6px;border:1px solid #ddd;background:#eee;display:block}}
+ figcaption{{font-size:11px;color:#666;margin-top:3px}}
+ .pager{{display:flex;gap:14px;align-items:center;justify-content:center;margin:18px 0;font-size:14px}}
+ .pager .pg{{padding:6px 12px;border:1px solid #ccd1d4;border-radius:5px;color:#0a7;text-decoration:none}}
+ .pager .pg.off{{color:#bbb;border-color:#eee}}
+</style>
+{_tabbar('gallery')}
+<main>
+<form class=flt method=get>
+ <input type=hidden name=device value="{_esc(dev)}">
+ <label>from date<input type=text size=12 placeholder=yyyy-mm-dd pattern="\\d{{4}}-\\d{{2}}-\\d{{2}}" title="yyyy-mm-dd" name=from value="{vf}"></label>
+ <label>to date<input type=text size=12 placeholder=yyyy-mm-dd pattern="\\d{{4}}-\\d{{2}}-\\d{{2}}" title="yyyy-mm-dd" name=to value="{vt}"></label>
+ <label>from time<input type=time name=tfrom value="{vtf}"></label>
+ <label>to time<input type=time name=tto value="{vtt}"></label>
+ <button type=submit>Apply</button>
+</form>
+<div class=grid>{cells}</div>
+{pager}
+</main>
+"""
+
+
+@app.get("/gallery", response_class=HTMLResponse)
+def gallery(request: Request, device: str = "pi-cam",
+            from_: str = Query(None, alias="from"), to: str = Query(None),
+            tfrom: str = Query(None), tto: str = Query(None), page: int = Query(0)):
+    if not _logged_in(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(_gallery_html(device, from_, to, page, tfrom, tto))

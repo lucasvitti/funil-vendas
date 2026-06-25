@@ -15,6 +15,7 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -71,6 +72,12 @@ def upload_vectors(base, device, tok, compare_window, place=""):
     state = Path("data/.upload_vec_state")
     last = int(state.read_text()) if state.exists() else 0
     con = sqlite3.connect(str(db))
+    # self-heal a stale watermark: if the local table was erased/reset (rowid
+    # counter restarts at 1), `last` can sit above every live rowid and silently
+    # suppress all uploads. Detect that and restart from 0.
+    mx = con.execute("SELECT max(rowid) FROM vectors").fetchone()[0] or 0
+    if mx < last:
+        last = 0
     rows = con.execute(
         "SELECT rowid, ts, cam, track, event, mode, vec, clarity, face_visible, "
         "body_visible, image, match_track, match_dist FROM vectors WHERE rowid > ? ORDER BY rowid",
@@ -102,18 +109,35 @@ def upload_images(base, device, tok, delete=True):
     if not d.exists():
         return "images: no-dir"
     files = sorted(d.glob("*.jpg"))
-    sent = 0
+    sent = dropped = 0
     for f in files:
         try:
-            b64 = base64.b64encode(f.read_bytes()).decode()
+            data = f.read_bytes()
+            if not data:                       # 0-byte/corrupt capture — junk it, don't wedge the queue
+                f.unlink(missing_ok=True)
+                dropped += 1
+                continue
+            b64 = base64.b64encode(data).decode()
             _post(base + "/api/snapshots", {"device": device, "name": f.name, "image_b64": b64}, tok)
             sent += 1
             if delete:
                 f.unlink(missing_ok=True)
-        except Exception as ex:
-            print(f"  image {f.name} failed: {ex}")
+        except urllib.error.HTTPError as ex:
+            # 4xx = the server rejected THIS file (empty/oversized/bad) — discard it and
+            # keep going so one bad file can't block every later snapshot. 5xx is
+            # transient (server-side): stop and retry the whole batch next cycle.
+            if 400 <= ex.code < 500:
+                print(f"  image {f.name} rejected ({ex.code}) — dropping")
+                f.unlink(missing_ok=True)
+                dropped += 1
+                continue
+            print(f"  image {f.name} failed: {ex} — retry next cycle")
             break
-    return f"images: {sent}"
+        except Exception as ex:
+            print(f"  image {f.name} failed: {ex} — retry next cycle")
+            break
+    tail = f" (dropped {dropped})" if dropped else ""
+    return f"images: {sent}{tail}"
 
 
 def upload_frames(base, device, tok):
@@ -165,6 +189,9 @@ def main(config_path="config.pi.yaml", loop=False):
     if place:
         print(f"location: {place}")
 
+    # remember the restart watermark at startup; if the operator bumps it from the
+    # hosted UI, exit so systemd relaunches us (re-pulling place + server config).
+    restart_baseline = server_config.check_restart(base, device, tok)
     while True:
         out = []
         if s.get("upload_events", True):
@@ -176,6 +203,9 @@ def main(config_path="config.pi.yaml", loop=False):
         if s.get("upload_frames", True):
             out.append(_safe(upload_frames, base, device, tok))
         print("  ".join(out))
+        if server_config.check_restart(base, device, tok) > restart_baseline:
+            print("restart requested from server — exiting for systemd relaunch", flush=True)
+            sys.exit(0)
         if not loop:
             break
         time.sleep(interval)
